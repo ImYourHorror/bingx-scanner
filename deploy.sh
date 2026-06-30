@@ -5,8 +5,13 @@
 set -euo pipefail
 APP_DIR=/opt/bingx-scanner
 SVC_USER=gapscan
-sudo -u "$SVC_USER" git -C "$APP_DIR" pull --ff-only
-# папка под sqlite-лог сигналов (юнит разрешает запись только сюда)
+# Шаг 1: подтянуть код и ПЕРЕЗАПУСТИТЬСЯ свежей версией скрипта. Без re-exec bash доисполняет
+# СТАРУЮ версию deploy.sh (загруженную в память до pull) и новые шаги не применятся.
+if [ "${DEPLOY_REEXEC:-}" != "1" ]; then
+  sudo -u "$SVC_USER" git -C "$APP_DIR" pull --ff-only
+  DEPLOY_REEXEC=1 exec bash "$APP_DIR/deploy.sh"
+fi
+# Шаг 2 (уже в свежей версии): папка под sqlite-лог сигналов (юнит разрешает запись только сюда)
 sudo install -d -o "$SVC_USER" -g "$SVC_USER" "$APP_DIR/data"
 # пересобрать systemd-юнит из репо (мог измениться) и перечитать
 sudo install -m644 "$APP_DIR/deploy/bingx-scanner.service" /etc/systemd/system/bingx-scanner.service

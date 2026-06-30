@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 *.log
+# локальная БД сигналов (датасет) — не в git
+data/
+*.db
 .env
 # живой Caddyfile с хэшем пароля держим только на сервере, не в git
 deploy/Caddyfile

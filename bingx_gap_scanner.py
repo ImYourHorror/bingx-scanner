@@ -30,8 +30,8 @@ BingX TradFi real-time scanner — точные % в реалтайме (гла�
 Запуск:  python bingx_gap_scanner.py   → открой http://127.0.0.1:8787
 """
 
-import os, re, sys, json, time, gzip, base64, socket, ssl, struct, threading, webbrowser, urllib.request
-from urllib.parse import urlencode, urlparse, parse_qs
+import os, re, sys, json, time, gzip, base64, socket, ssl, struct, sqlite3, threading, webbrowser, urllib.request, urllib.error
+from urllib.parse import urlencode, urlparse, parse_qs, quote
 from datetime import datetime, timedelta, timezone, time as dtime
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -110,6 +110,23 @@ YF_FIX = {
 }
 # Фиксапы тикера BingX → символ Pyth (Equity.US.<X>/USD)
 PYTH_FIX = {"BRKB": "BRK.B", "IBMR": "IBM", "NETFLIX": "NFLX"}
+# Фиксапы тикера BingX → реальный US-тикер для Finnhub (close pc). Иностранные без US-листинга
+# (SAMSUNG, SKHYNIX) сюда НЕ кладём → Finnhub не вернёт pc → гэп прочерк (так и надо).
+FINNHUB_FIX = {"BRKB": "BRK.B", "IBMR": "IBM", "NETFLIX": "NFLX", "TSMU": "TSM"}
+
+# Универс: оставляем только акции/ETF (NCSK). QQQ — внутри NCSK (датчик режима).
+# Форекс (NCFX), товары (NCCO) и индексы (NCSI) выкинуты.
+ALLOWED_FAMILIES = {"stock"}
+
+# Источник клоуз-референса (переключаемо: Hermes-Pyth станет платным с 31.07.2026,
+# поэтому Finnhub — основной надёжный клоуз; параметр на будущее).
+CLOSE_SOURCE      = os.environ.get("GAP_CLOSE_SRC", "finnhub")
+FINNHUB_MIN_GAP   = 1.1     # сек между вызовами Finnhub (free 60/мин) → ~55/мин
+BASIS_SUSPECT_PCT = 5.0     # |live−Pyth|/Pyth выше → строка «данные сомнительны», гэп не торговый
+OI_REFRESH        = 20      # сек паузы между полными циклами опроса OI
+LOG_INTERVAL      = 60      # сек, как часто писать снапшот в sqlite
+DB_PATH = os.environ.get("GAP_DB_PATH") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "signals.db")
 
 
 # ----------------------------- HTTP helpers -----------------------------
@@ -151,7 +168,7 @@ def fetch_universe():
             continue
         sym = c.get("symbol", "")
         fam = family_of(sym)
-        if not fam:
+        if not fam or fam not in ALLOWED_FAMILIES:   # только NCSK-акции/ETF (вкл. QQQ)
             continue
         disp = c.get("displayName") or sym
         b = base_ticker(sym)
@@ -341,10 +358,21 @@ class PythFeed:
         usmap = {}
         for f in cat:
             a = f.get("attributes", {}) or {}
-            sym = a.get("symbol", ""); desc = (a.get("description") or "").upper()
+            desc = (a.get("description") or "").upper()
+            if "DEPRECATED" in desc:                  # .PRE/.POST/.ON — пропускаем
+                continue
+            sym = a.get("symbol", "")
+            country = (a.get("country") or "").upper()
+            qcur = (a.get("quote_currency") or a.get("quoteCurrency") or "").upper()
+            base_attr = a.get("base")
+            tk = None
             m = re.match(r"^Equity\.US\.(.+?)/USD$", sym)
-            if m and "DEPRECATED" not in desc:
-                usmap[m.group(1)] = f["id"]
+            if m:
+                tk = m.group(1)
+            elif country == "US" and qcur == "USD" and base_attr:   # шире, чем регэксп
+                tk = base_attr
+            if tk:
+                usmap.setdefault(tk, f["id"])
         for b in self.bases:
             key = PYTH_FIX.get(b, b)
             fid = usmap.get(key)
@@ -509,64 +537,73 @@ def yahoo_daily(sym):
         rows.append((d, float(c)))
     return rows, meta
 
-def close_finnhub(ticker):
+class RateLimited(Exception):
+    pass
+
+def us_ticker(base):
+    """Базовый тикер перпа → реальный US-тикер для Finnhub."""
+    return FINNHUB_FIX.get(base, base)
+
+def finnhub_pc(ticker):
+    """Вчерашний RTH-клоуз (pc) c Finnhub. None если нет данных; RateLimited на 429."""
     if not FINNHUB_KEY:
         return None
-    j = _http_json(f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_KEY}")
-    pc = j.get("pc") if isinstance(j, dict) else None
-    return float(pc) if pc else None
+    url = f"https://finnhub.io/api/v1/quote?symbol={quote(ticker)}&token={FINNHUB_KEY}"
+    req = urllib.request.Request(url, headers={"User-Agent": "gap-scanner"})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as r:
+            j = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            raise RateLimited()
+        return None
+    except Exception:
+        return None
+    try:
+        pc = float(j.get("pc"))
+    except Exception:
+        return None
+    return pc if pc and pc > 0 else None
 
 class RefData:
-    """Дневной close + регион/таймзона на тикер. Кэш на торговый день региона."""
+    """Дневной previous-close (RTH) из Finnhub — ОСНОВНОЙ клоуз-референс по US-тикерам.
+    pc меняется раз в день → тянем последовательно с задержкой (free-лимит 60/мин,
+    ~150 тикеров за ~3 мин), кэшируем на торговый день US, обновляем при смене даты ET.
+    Yahoo больше не используется (Finnhub надёжнее и не отдаёт местную валюту по US-ADR)."""
     def __init__(self, instruments):
-        self.inst = instruments
-        self.ref = {}               # base -> dict(close, region, tz, exch, yf)
+        self.inst = [it for it in instruments if it["fam"] == "stock"]
+        self.ref = {}               # base -> dict(close, src, region, cur, us, day)
         self.lock = threading.Lock()
     def start(self):
         threading.Thread(target=self._loop, daemon=True).start()
     def get(self, base):
         with self.lock:
             return self.ref.get(base)
-    def _yahoo_symbol(self, it):
-        b = it["base"]
-        return YF_FIX.get(b, b)
-    def _region_from_meta(self, meta):
-        tzname = meta.get("exchangeTimezoneName") or ""
-        return TZ_TO_REGION.get(tzname, "US"), tzname
+    def _us_day(self):
+        return datetime.now(_et_naive_tz("America/New_York")).strftime("%Y-%m-%d")
     def _loop(self):
         while True:
+            day = self._us_day()
             for it in self.inst:
-                if it["fam"] not in ("stock", "index"):
-                    continue                          # close нужен только акциям/индексам
                 b = it["base"]
-                # уже есть на сегодня (по региону)?
                 cur = self.ref.get(b)
-                yf = self._yahoo_symbol(it)
-                try:
-                    rows, meta = yahoo_daily(yf)
-                    region, tzname = self._region_from_meta(meta)
-                    tz = _et_naive_tz(tzname) if tzname else _et_naive_tz(REGIONS.get(region, REGIONS["US"])[0])
-                    today = datetime.now(tz).strftime("%Y-%m-%d")
-                    close = None
-                    for d, c in rows:
-                        if d < today:
-                            close = c
-                    if close is None and rows:
-                        close = rows[-1][1]
-                    if close is None:
-                        close = close_finnhub(yf)
-                    with self.lock:
-                        self.ref[b] = {"close": close, "region": region,
-                                       "tz": tzname or REGIONS.get(region, REGIONS["US"])[0],
-                                       "exch": meta.get("fullExchangeName"),
-                                       "cur": meta.get("currency"), "yf": yf}
-                except Exception:
-                    if b not in self.ref:
-                        with self.lock:
-                            self.ref[b] = {"close": None, "region": "US", "tz": "America/New_York",
-                                           "exch": None, "cur": "USD", "yf": yf}
-                time.sleep(0.15)                      # бережём Yahoo от burst
-            time.sleep(CLOSE_REFRESH)
+                if cur and cur.get("day") == day:     # уже тянули сегодня (вкл. «нет данных»)
+                    continue
+                ust = us_ticker(b)
+                pc = None
+                for _ in range(3):                    # backoff на 429
+                    try:
+                        pc = finnhub_pc(ust); break
+                    except RateLimited:
+                        time.sleep(5)
+                    except Exception:
+                        break
+                with self.lock:
+                    self.ref[b] = {"close": pc, "src": ("finnhub" if pc else None),
+                                   "region": "US", "cur": ("USD" if pc else None),
+                                   "us": ust, "day": day}
+                time.sleep(FINNHUB_MIN_GAP)           # бережём free-лимит 60/мин
+            time.sleep(CLOSE_REFRESH)                 # ждём, пока не сменится день ET
 
 
 # ----------------------------- region / session / DST window -----------------------------
@@ -609,6 +646,74 @@ def window_msk_str(region):
     return wl.astimezone(MSK).strftime("%H:%M")
 
 
+# ----------------------------- open interest (BingX REST) -----------------------------
+class OIFeed:
+    """Открытый интерес по символам. Bulk-эндпоинта нет → опрашиваем по одному с паузой.
+    OI меняется медленно, полный цикл ~минута — ок."""
+    def __init__(self, symbols):
+        self.symbols = symbols
+        self.oi = {}                # sym -> float
+        self.lock = threading.Lock()
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+    def get(self, sym):
+        with self.lock:
+            return self.oi.get(sym)
+    def _loop(self):
+        while True:
+            for sym in self.symbols:
+                try:
+                    d = _bingx("/openApi/swap/v2/quote/openInterest", {"symbol": sym})
+                    v = d.get("openInterest") if isinstance(d, dict) else (
+                        d[0].get("openInterest") if isinstance(d, list) and d else None)
+                    if v is not None:
+                        with self.lock:
+                            self.oi[sym] = float(v)
+                except Exception:
+                    pass
+                time.sleep(0.25)
+            time.sleep(OI_REFRESH)
+
+
+# ----------------------------- signal log (sqlite3, stdlib) -----------------------------
+class SignalLog:
+    """Тихий лог снапшотов в SQLite — датасет под будущий форвард-тест гэпов."""
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.conn = None
+        self.ok = False
+    def start(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            self.conn = sqlite3.connect(self.path, check_same_thread=False)
+            self.conn.execute("""CREATE TABLE IF NOT EXISTS signals(
+                ts INTEGER, ticker TEXT, gap REAL, live_price REAL, close_ref REAL,
+                basis REAL, funding REAL, oi REAL, qqq_regime REAL, session TEXT)""")
+            self.conn.commit()
+            self.ok = True
+        except Exception as e:
+            self.ok = False
+            print(f"!! SignalLog отключён (не пишется {self.path}): {e}")
+    def write(self, ts, rows, qqq):
+        if not self.ok:
+            return
+        try:
+            recs = []
+            for r in rows:
+                if r.get("gap") is None:              # пишем только торговые гэпы
+                    continue
+                fr = (r.get("funding") or {}).get("rate")
+                recs.append((ts, r["ticker"], r["gap"], r["live"], r["close"],
+                             r.get("basis"), fr, r.get("oi"), qqq, r["session"]))
+            if recs:
+                with self.lock:
+                    self.conn.executemany("INSERT INTO signals VALUES(?,?,?,?,?,?,?,?,?,?)", recs)
+                    self.conn.commit()
+        except Exception:
+            pass
+
+
 # ----------------------------- snapshot builder -----------------------------
 STATE = {"updated": None, "rows": [], "strategy": {}, "regime": None,
          "ws": "—", "pyth": "—", "note": "", "now_msk": None, "windows": {}}
@@ -632,7 +737,7 @@ def _strategy_label(base, gap):
         return "short_weak", "1–2% шорт, не ядро", tag
     return "long_weak", "1–2% лонг — слабая нога", tag   # перп НИЖЕ close
 
-def build_snapshot(inst, pf, prem, pyth, ref):
+def build_snapshot(inst, pf, prem, pyth, ref, oif):
     rows = []
     regime = None
     buckets = {"fade_short": [], "short_weak": [], "long_weak": [], "skip": [], "noise": []}
@@ -659,37 +764,40 @@ def build_snapshot(inst, pf, prem, pyth, ref):
                            "ih": pm.get("fundingIntervalHours")}
             except Exception:
                 funding = None
-        # внешний кросс-чек Pyth (только акции) + добивка base-линии графика
-        vp = None
-        if fam == "stock":
-            pp = pyth.get(base)
-            if pp and live is not None and pp[0]:
-                vp = (live - pp[0]) / pp[0] * 100
-            if SERIES is not None and pp and pp[0]:
-                SERIES.add_base(sym, pp[0], time.time())
-        # close / регион
-        rd = ref.get(base) if fam in ("stock", "index") else None
+        # Pyth = real-time «реальная цена базы» (кросс-чек) + добивка base-линии графика
+        vp = None; base_px = None
+        pp = pyth.get(base)
+        if pp and pp[0]:
+            base_px = pp[0]
+            if live is not None:
+                vp = (live - base_px) / base_px * 100
+            if SERIES is not None:
+                SERIES.add_base(sym, base_px, time.time())
+        basis = vp                                    # (live − база)/база, %
+        # close-референс (Finnhub pc — основной) и регион
+        rd = ref.get(base)
         close = rd["close"] if rd else None
-        cur = (rd or {}).get("cur")
-        if fam == "forex":
-            region = "FX"
-        elif fam == "commodity":
-            region = "COMM"
-        else:
-            region = (rd or {}).get("region", "US")
-        # перп номинирован в USD; иностранную акцию в местной валюте сравнивать нельзя → close/gap прячем
-        if fam == "stock" and cur not in (None, "USD"):
-            close = None
-        gap = None
+        close_src = rd.get("src") if rd else None
+        region = (rd or {}).get("region", "US")
+        # гэп + надёжность (1c): лучше прочерк, чем мусор
+        gap = None; gap_raw = None; suspect = False; reason = None
         if close and live is not None and close != 0:
-            g = (live - close) / close * 100
-            if abs(g) <= 25:          # бэкстоп от рассинхрона единиц/инструмента
-                gap = g
+            gap_raw = (live - close) / close * 100
+            if basis is not None and abs(basis) > BASIS_SUSPECT_PCT:
+                suspect = True; reason = f"перп оторван от Pyth {basis:+.1f}%"
+            elif abs(gap_raw) > 25:
+                suspect = True; reason = "аномалия >25%"
+            else:
+                gap = gap_raw                         # торговый гэп
+        elif live is not None:
+            reason = "нет надёжного клоуза (Finnhub)"
+        oi = oif.get(sym) if oif else None
         st, in_win = session_state(region)
         row = {
             "ticker": it["tick"], "symbol": it["display"], "api": sym, "fam": fam,
-            "live": live, "close": close, "gap": gap,
-            "premium": premium, "pyth": vp, "funding": funding,
+            "live": live, "close": close, "close_src": close_src,
+            "gap": gap, "gap_raw": gap_raw, "suspect": suspect, "reason": reason,
+            "premium": premium, "pyth": vp, "basis": basis, "funding": funding, "oi": oi,
             "taker": it["taker"], "region": region, "session": st, "in_win": in_win,
             "tag": ("core" if base in CORE else ("avoid" if base in AVOID else "")),
             "is_regime": (base == REGIME),
@@ -733,10 +841,18 @@ def build_snapshot(inst, pf, prem, pyth, ref):
             "note": "",
         })
 
-def updater(inst, pf, prem, pyth, ref):
+def updater(inst, pf, prem, pyth, ref, oif, siglog):
+    last_log = 0.0
     while True:
         try:
-            build_snapshot(inst, pf, prem, pyth, ref)
+            build_snapshot(inst, pf, prem, pyth, ref, oif)
+            now = time.time()
+            if siglog and now - last_log >= LOG_INTERVAL:
+                with LOCK:
+                    rows = list(STATE.get("rows", []))
+                    rg = STATE.get("regime")
+                siglog.write(int(now), rows, (rg.get("gap") if rg else None))
+                last_log = now
         except Exception as e:
             with LOCK:
                 STATE["note"] = f"updater error: {e}"
@@ -1100,14 +1216,21 @@ def main():
     prem = PremiumFeed()
     pyth = PythFeed(bases)
     ref  = RefData(inst)
-    pf.start(); prem.start(); pyth.start(); ref.start(); SERIES.start()
+    oif  = OIFeed(symbols)
+    siglog = SignalLog(DB_PATH)
+    pf.start(); prem.start(); pyth.start(); ref.start(); oif.start(); SERIES.start(); siglog.start()
     print(f"WS: подписка на {len(symbols)} символов ({(len(symbols)+SUBS_PER_WS-1)//SUBS_PER_WS} соединений).")
-    print(f"График: буфер 10 мин/символ — сид из 1m-klines (фоном) + добивка из WS; линия базы = Pyth/Yahoo.")
+    print(f"График: буфер 10 мин/символ — сид из 1m-klines (фоном) + добивка из WS; линия базы = Pyth.")
+    if FINNHUB_KEY:
+        print(f"Close-референс: Finnhub pc (основной), {len(bases)} тикеров последовательно (~3 мин).")
+    else:
+        print("!! FINNHUB_API_KEY не задан — клоуза не будет, гэпы пойдут прочерком. Задай env-ключ.")
+    print(f"SQLite-лог сигналов: {DB_PATH if siglog.ok else '(отключён)'}")
     time.sleep(2.0)  # дать ws/premium наполниться
     cov_c, cov_t = pyth.coverage()
     print(f"Pyth Hermes: покрытие акций {cov_c}/{cov_t} (Equity.US.*). Спред-премиум — у всех инструментов.")
 
-    threading.Thread(target=updater, args=(inst, pf, prem, pyth, ref), daemon=True).start()
+    threading.Thread(target=updater, args=(inst, pf, prem, pyth, ref, oif, siglog), daemon=True).start()
 
     srv = None
     for p in range(PORT, PORT + 10):

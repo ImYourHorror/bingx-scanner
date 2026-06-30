@@ -6,6 +6,11 @@ set -euo pipefail
 APP_DIR=/opt/bingx-scanner
 SVC_USER=gapscan
 sudo -u "$SVC_USER" git -C "$APP_DIR" pull --ff-only
+# папка под sqlite-лог сигналов (юнит разрешает запись только сюда)
+sudo install -d -o "$SVC_USER" -g "$SVC_USER" "$APP_DIR/data"
+# пересобрать systemd-юнит из репо (мог измениться) и перечитать
+sudo install -m644 "$APP_DIR/deploy/bingx-scanner.service" /etc/systemd/system/bingx-scanner.service
+sudo systemctl daemon-reload
 sudo systemctl restart bingx-scanner
 echo "✅ Обновлено. Статус:"
 systemctl --no-pager status bingx-scanner | head -n 6

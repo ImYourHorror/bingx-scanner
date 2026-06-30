@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.log
+.env
+# живой Caddyfile с хэшем пароля держим только на сервере, не в git
+deploy/Caddyfile

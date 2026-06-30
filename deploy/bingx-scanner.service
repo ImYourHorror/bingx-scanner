@@ -1,0 +1,40 @@
+[Unit]
+Description=BingX TradFi realtime scanner
+Documentation=https://github.com/USER/bingx-scanner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gapscan
+Group=gapscan
+WorkingDirectory=/opt/bingx-scanner
+# Слушаем ТОЛЬКО loopback — наружу отдаёт Caddy (reverse-proxy + HTTPS + Basic Auth).
+# Для Tailscale-режима bootstrap.sh заменит на GAP_HOST=0.0.0.0 (доступ режет ufw).
+Environment=GAP_HOST=127.0.0.1
+Environment=GAP_PORT=8787
+Environment=GAP_OPEN_BROWSER=0
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Торговых ключей BingX тут НЕТ и быть не должно — сканер только читает публичные эндпоинты.
+# Необязательный read-only фолбэк котировок (если нужен): раскомментируй и подставь свой ключ.
+# Environment=FINNHUB_API_KEY=xxxxxxxx
+ExecStart=/usr/bin/python3 /opt/bingx-scanner/bingx_gap_scanner.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+
+# --- hardening (сканер ничего не пишет на диск) ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+
+[Install]
+WantedBy=multi-user.target

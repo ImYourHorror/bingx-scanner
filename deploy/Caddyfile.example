@@ -1,0 +1,15 @@
+# Пример для публичного режима (Caddy сам выпустит HTTPS через Let's Encrypt).
+# bootstrap.sh caddy <домен> <логин> создаёт рабочий /etc/caddy/Caddyfile автоматически —
+# этот файл просто для понимания/ручной правки.
+#
+# Заменить scanner.example.com на свой домен (A-запись → IP сервера).
+# Хэш пароля сгенерить:  caddy hash-password   (введёшь пароль → получишь $2a$… хэш).
+# Директива в Caddy v2.8+ называется basic_auth; в более старых — basicauth.
+
+scanner.example.com {
+    encode zstd gzip
+    basic_auth {
+        partner $2a$14$ЗАМЕНИ_НА_BCRYPT_ХЭШ_ОТ_caddy_hash-password
+    }
+    reverse_proxy 127.0.0.1:8787
+}

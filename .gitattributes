@@ -1,0 +1,7 @@
+# Гарантируем LF в репозитории и при checkout (иначе CRLF ломает shebang bash на Linux-сервере).
+* text=auto eol=lf
+*.sh   text eol=lf
+*.py   text eol=lf
+*.service text eol=lf
+Caddyfile* text eol=lf
+*.md   text eol=lf

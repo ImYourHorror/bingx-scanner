@@ -575,7 +575,8 @@ class RefData:
             if fh: return fh, "finnhub"
         return None, None
     def _fetch_tv(self):
-        """→ {base: ref_close}. Биржу не гадаем: спрашиваем NASDAQ/NYSE/AMEX сразу, берём попавшую."""
+        """→ {base: {"ref": сессионный клоуз, "prev": вчерашний close−change_abs (для кросс-чека)}}.
+        Биржу не гадаем: спрашиваем NASDAQ/NYSE/AMEX сразу, берём попавшую."""
         out, s2b, syms = {}, {}, []
         for it in self.inst:
             t = us_ticker(it["base"])
@@ -586,10 +587,11 @@ class RefData:
                 j = tv_scan(syms[i:i+250], ["close", "change_abs"])
                 for row in (j.get("data") or []):
                     b = s2b.get(row.get("s")); d = row.get("d") or []
-                    if b and b not in out and len(d) >= 2:
-                        rc = self._ref_from(d[0], d[1])
-                        if rc:
-                            out[b] = rc
+                    if b and b not in out and len(d) >= 2 and isinstance(d[0], (int, float)):
+                        ref = self._ref_from(d[0], d[1])
+                        prev = (d[0] - d[1]) if isinstance(d[1], (int, float)) else None
+                        if ref:
+                            out[b] = {"ref": ref, "prev": prev}
             except Exception:
                 pass
         return out
@@ -603,10 +605,13 @@ class RefData:
                     tv = {}
                 with self.lock:
                     for it in self.inst:
-                        b = it["base"]; tvc = tv.get(b); fh = self.ref.get(b, {}).get("fh")
+                        b = it["base"]; td = tv.get(b) or {}
+                        tvc = td.get("ref"); tvp = td.get("prev")
+                        fh = self.ref.get(b, {}).get("fh")
                         close, src = self._combine(tvc, fh)
-                        self.ref[b] = {"close": close, "src": src, "tv": tvc, "fh": fh,
-                                       "mismatch": bool(tvc and fh and abs(tvc-fh)/fh > 0.02),
+                        # кросс-чек: вчерашний клоуз TV (close−change_abs) vs Finnhub pc — как с как
+                        self.ref[b] = {"close": close, "src": src, "tv": tvc, "tvprev": tvp, "fh": fh,
+                                       "mismatch": bool(tvp and fh and abs(tvp-fh)/fh > 0.02),
                                        "region": "US", "cur": ("USD" if close else None),
                                        "us": us_ticker(b), "day": marker}
                 self._marker = marker
@@ -619,10 +624,10 @@ class RefData:
                             except RateLimited: time.sleep(5)
                             except Exception: break
                         with self.lock:
-                            r = self.ref.get(b, {}); tvc = r.get("tv")
+                            r = self.ref.get(b, {}); tvc = r.get("tv"); tvp = r.get("tvprev")
                             close, src = self._combine(tvc, fh)
                             r.update({"fh": fh, "close": close, "src": src,
-                                      "mismatch": bool(tvc and fh and abs(tvc-fh)/fh > 0.02),
+                                      "mismatch": bool(tvp and fh and abs(tvp-fh)/fh > 0.02),
                                       "cur": ("USD" if close else None)})
                             self.ref[b] = r
                         time.sleep(FINNHUB_MIN_GAP)
@@ -819,7 +824,7 @@ def build_snapshot(inst, pf, prem, pyth, ref, oif):
             else:
                 gap = gap_raw                         # торговый гэп
                 if close_mismatch:
-                    reason = f"клоуз расходится: TV {rd.get('tv')} vs Finnhub {rd.get('fh')}"
+                    reason = f"клоуз расходится: TV-вчера {rd.get('tvprev')} vs Finnhub {rd.get('fh')}"
         elif live is not None:
             reason = "нет надёжного клоуза (TV/Finnhub)"
         oi = oif.get(sym) if oif else None

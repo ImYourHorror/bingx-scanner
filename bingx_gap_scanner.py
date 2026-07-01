@@ -518,11 +518,8 @@ def finnhub_pc(ticker):
         return None
     return pc if pc and pc > 0 else None
 
-# NYSE-тикеры (иначе NASDAQ) — для UI-ссылки на график TV. Для СЕРВЕРНОГО клоуза биржу не гадаем:
-# спрашиваем все площадки сразу (см. RefData._fetch_tv), берём ту, что вернула данные.
-NYSE_TICKERS = {"GS","JPM","MS","JNJ","XOM","COP","OXY","SLB","LNG","PFE","LLY","MCD","NKE","WMT",
-                "GE","F","IBM","LMT","MGM","MP","NU","RACE","BB","GLW","HPQ","CCL","CRCL","ORCL",
-                "GME","SPCE","UNH","SNAP","BRKB","DELL"}
+# Биржу для TV-символа НЕ гадаем: берём готовое "s" ("EXCHANGE:SYMBOL") из ответа screener
+# (RefData._fetch_tv → tvsym в строке). Клоуз/гэп биржу тоже не гадают — те же данные screener.
 
 def tv_scan(tv_syms, columns):
     """POST на TradingView screener (keyless, stdlib). → JSON {data:[{s,d},...]}."""
@@ -576,7 +573,7 @@ class RefData:
             if fh: return fh, "finnhub"
         return None, None
     def _fetch_tv(self):
-        """→ {base: {"ref": сессионный клоуз, "prev": вчерашний close−change_abs (для кросс-чека)}}.
+        """→ {base: {"ref": клоуз, "prev": вчерашний close−change_abs, "tvsym": "EXCHANGE:SYMBOL" из ответа}}.
         Биржу не гадаем: спрашиваем NASDAQ/NYSE/AMEX сразу, берём попавшую."""
         out, s2b, syms = {}, {}, []
         for it in self.inst:
@@ -592,7 +589,7 @@ class RefData:
                         ref = self._ref_from(d[0], d[1])
                         prev = (d[0] - d[1]) if isinstance(d[1], (int, float)) else None
                         if ref:
-                            out[b] = {"ref": ref, "prev": prev}
+                            out[b] = {"ref": ref, "prev": prev, "tvsym": row.get("s")}
             except Exception:
                 pass
         return out
@@ -612,6 +609,7 @@ class RefData:
                         close, src = self._combine(tvc, fh)
                         # кросс-чек: вчерашний клоуз TV (close−change_abs) vs Finnhub pc — как с как
                         self.ref[b] = {"close": close, "src": src, "tv": tvc, "tvprev": tvp, "fh": fh,
+                                       "tvsym": td.get("tvsym"),
                                        "mismatch": bool(tvp and fh and abs(tvp-fh)/fh > 0.02),
                                        "region": "US", "cur": ("USD" if close else None),
                                        "us": us_ticker(b), "day": marker}
@@ -873,7 +871,7 @@ def build_snapshot(inst, pf, prem, pyth, tw, ref, oif):
         st, in_win = session_state(region)
         row = {
             "ticker": it["tick"], "symbol": it["display"], "api": sym, "fam": fam,
-            "live": live, "close": close, "close_src": close_src, "close_mismatch": close_mismatch,
+            "live": live, "close": close, "close_src": close_src, "tvsym": (rd or {}).get("tvsym"), "close_mismatch": close_mismatch,
             "gap": gap, "gap_raw": gap_raw, "suspect": suspect, "reason": reason,
             "premium": premium, "basis": basis, "funding": funding, "oi": oi,
             "taker": it["taker"], "region": region, "session": st, "in_win": in_win,
@@ -1096,12 +1094,11 @@ const REFRESH=__REFRESH__;
 const f2=(x,d=2)=>x==null?'—':Number(x).toFixed(d);
 const sgn=(x,d=2)=>x==null?'—':(x>0?'+':'')+Number(x).toFixed(d);
 const cls=x=>x==null?'mut':(x>0?'up':(x<0?'dn':''));
-let LAST=null, SEL=null, SELTICK=null, SELSRC=null, TVON=false, LASTORDER='';
+let LAST=null, SEL=null, SELTICK=null, SELTVSYM=null, SELSRC=null, TVON=false, LASTORDER='';
 let SORT={key:null,dir:0}, FROZEN=false, FROZEN_ORDER=null;
 let CHART=null,BXS=null,BASES=null,CHARTBOX=null,CHARTROW=null,lastBxT=0,lastBaseT=0;
 const rowEls=new Map();
-const NYSE=new Set(['GS','JPM','MS','JNJ','XOM','COP','OXY','SLB','LNG','PFE','LLY','MCD','NKE','WMT','GE','F','IBM','LMT','MGM','MP','NU','RACE','BB','GLW','HPQ','CCL','CRCL','ORCL','GME','SPCE','UNH','SNAP','BRKB','DELL']);
-const tvExch=tk=>NYSE.has((tk||'').toUpperCase())?'NYSE':'NASDAQ';
+/* TV-символ (ссылка + виджет) берём точным из данных строки (row.tvsym = "EXCHANGE:SYMBOL" из screener), без угадайки биржи */
 
 function show(t){['num','strat','faq'].forEach(x=>{
   document.getElementById(x).className=(x==t?'':'hide');
@@ -1224,7 +1221,12 @@ function selectRow(api,tick,source){
   fillChartBox(tick,api);positionChart();initChart();refreshChart(true);}
 function fillChartBox(tick,api){
   if(!CHARTBOX){CHARTBOX=document.createElement('div');CHARTBOX.className='cbox';}
-  const ex=tvExch(tick);
+  const rr=LAST?LAST.rows.find(r=>r.api===api):null;
+  const tvsym=(rr&&rr.tvsym)||null; SELTVSYM=tvsym;   // точный TV-символ из screener; нет → без TV-навигации
+  const tvrow=tvsym
+    ? `<div class="tvrow"><span class="tvbtn" id="tvbtn" onclick="toggleTV()">показать TradingView</span>`
+      +`<a class="tvchart" target="_blank" rel="noopener" href="https://www.tradingview.com/chart/?symbol=${tvsym}">график на TradingView ↗</a></div>`
+    : `<div class="tvrow"><span class="mut" style="font-size:11px">TradingView: символ не найден</span></div>`;
   CHARTBOX.innerHTML=
     `<div class="chead"><b>${tick} · ${api}</b>`+
     `<a class="mut" style="margin-left:8px" target="_blank" rel="noopener" href="https://bingx.com/en/perpetual/${api}">BingX ↗</a>`+
@@ -1232,8 +1234,7 @@ function fillChartBox(tick,api){
     `<div id="cchart"></div>`+
     `<div class="cleg"><span style="color:#2f81f7">━ BingX перп</span> &nbsp; <span style="color:#d29922">━ <span id="lbase">база</span></span>`+
     `<span class="tvattr">графики: <a href="https://www.tradingview.com" target="_blank" rel="noopener">TradingView</a> Lightweight Charts™</span></div>`+
-    `<div class="tvrow"><span class="tvbtn" id="tvbtn" onclick="toggleTV()">показать TradingView</span>`+
-    `<a class="tvchart" target="_blank" rel="noopener" href="https://www.tradingview.com/chart/?symbol=${ex}:${encodeURIComponent(tick)}">график на TradingView ↗</a></div>`+
+    tvrow+
     `<div id="tvwrap"></div>`;}
 function ensureChartRow(){if(!CHARTROW){CHARTROW=document.createElement('tr');CHARTROW.className='chartrow';
     CHARTROW.innerHTML='<td colspan="5"></td>';}return CHARTROW;}
@@ -1280,7 +1281,7 @@ function toggleTV(){TVON=!TVON;const wrap=document.getElementById('tvwrap');cons
   wrap.innerHTML='<div class="tradingview-widget-container"><div class="tradingview-widget-container__widget"></div></div>';
   const sc=document.createElement('script');
   sc.src='https://s3.tradingview.com/external-embedding/embed-widget-symbol-overview.js';sc.async=true;
-  sc.text=JSON.stringify({symbols:[[SELTICK]],chartOnly:false,width:'100%',height:300,colorTheme:'dark',isTransparent:true,locale:'ru'});
+  sc.text=JSON.stringify({symbols:[[SELTVSYM]],chartOnly:false,width:'100%',height:300,colorTheme:'dark',isTransparent:true,locale:'ru'});
   wrap.querySelector('.tradingview-widget-container').appendChild(sc);}
 
 /* ---- poll ---- */

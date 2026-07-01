@@ -111,7 +111,7 @@ ALLOWED_FAMILIES = {"stock"}
 
 # Источник клоуз-референса (переключаемо: Hermes-Pyth станет платным с 31.07.2026,
 # поэтому Finnhub — основной надёжный клоуз; параметр на будущее).
-CLOSE_SOURCE      = os.environ.get("GAP_CLOSE_SRC", "finnhub")
+CLOSE_SOURCE      = os.environ.get("GAP_CLOSE_SRC", "tv")   # tv (осн.) | finnhub — переключаемо
 FINNHUB_MIN_GAP   = 1.1     # сек между вызовами Finnhub (free 60/мин) → ~55/мин
 BASIS_SUSPECT_PCT = 5.0     # |live−Pyth|/Pyth выше → строка «данные сомнительны», гэп не торговый
 OI_REFRESH        = 20      # сек паузы между полными циклами опроса OI
@@ -517,51 +517,116 @@ def finnhub_pc(ticker):
         return None
     return pc if pc and pc > 0 else None
 
+# NYSE-тикеры (иначе NASDAQ) — для UI-ссылки на график TV. Для СЕРВЕРНОГО клоуза биржу не гадаем:
+# спрашиваем все площадки сразу (см. RefData._fetch_tv), берём ту, что вернула данные.
+NYSE_TICKERS = {"GS","JPM","MS","JNJ","XOM","COP","OXY","SLB","LNG","PFE","LLY","MCD","NKE","WMT",
+                "GE","F","IBM","LMT","MGM","MP","NU","RACE","BB","GLW","HPQ","CCL","CRCL","ORCL",
+                "GME","SPCE","UNH","SNAP","BRKB","DELL"}
+
+def tv_scan(tv_syms, columns):
+    """POST на TradingView screener (keyless, stdlib). → JSON {data:[{s,d},...]}."""
+    body = json.dumps({"symbols": {"tickers": tv_syms, "query": {"types": []}},
+                       "columns": columns}).encode()
+    req = urllib.request.Request("https://scanner.tradingview.com/america/scan", data=body,
+        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 gap-scanner"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode("utf-8"))
+
 class RefData:
-    """Дневной previous-close (RTH) из Finnhub — ОСНОВНОЙ клоуз-референс по US-тикерам.
-    pc меняется раз в день → тянем последовательно с задержкой (free-лимит 60/мин,
-    ~150 тикеров за ~3 мин), кэшируем на торговый день US, обновляем при смене даты ET.
-    Yahoo больше не используется (Finnhub надёжнее и не отдаёт местную валюту по US-ADR)."""
+    """Реф-клоуз = ПОСЛЕДНЕЕ ЗАВЕРШЁННОЕ RTH-закрытие US.
+    ОСНОВНОЙ источник — TradingView screener (bulk, keyless): prev_close = close − change_abs
+    (в премаркете 15:30–16:30 МСК = вчерашний клоуз). ФОЛБЭК/КРОСС-ЧЕК — Finnhub pc.
+    Кэш на маркер (дата + pre/post 16:30 ET). GAP_CLOSE_SRC=tv|finnhub — переключаемо."""
     def __init__(self, instruments):
         self.inst = [it for it in instruments if it["fam"] == "stock"]
-        self.ref = {}               # base -> dict(close, src, region, cur, us, day)
+        self.ref = {}               # base -> dict(close, src, tv, fh, mismatch, region, cur, us, day)
         self.lock = threading.Lock()
+        self._marker = None
     def start(self):
         threading.Thread(target=self._loop, daemon=True).start()
     def get(self, base):
         with self.lock:
             return self.ref.get(base)
+    def _now_et(self):
+        return datetime.now(_et_naive_tz("America/New_York"))
     def _ref_marker(self):
-        # Референс-клоуз должен быть ПОСЛЕДНИМ ЗАВЕРШЁННЫМ RTH-закрытием US.
-        # Маркер меняется при смене даты ET (00:00 ET = 07:00 МСК, задолго до премаркета
-        # 15:30–16:30 МСК → к премаркету pc свежий = вчерашний клоуз) И после 17:00 ET
-        # (закрытие+сеттлмент → pc перевернулся на сегодняшний клоуз для вечера/овернайта).
-        now = datetime.now(_et_naive_tz("America/New_York"))
-        phase = "post" if (now.weekday() < 5 and (now.hour, now.minute) >= (17, 0)) else "pre"
+        now = self._now_et()
+        phase = "post" if (now.weekday() < 5 and (now.hour, now.minute) >= (16, 30)) else "pre"
         return now.strftime("%Y-%m-%d") + phase
+    def _ref_from(self, close, change_abs):
+        """close/change_abs c TV → последнее ЗАВЕРШЁННОЕ RTH-закрытие (сессионно-зависимо).
+        Регулярка ИДЁТ (9:30–16:00 ET, будни): TV close = ЖИВАЯ цена → завершённый = вчерашний
+          = close − change_abs. Регулярка НЕ идёт (премаркет / afterhours / выходной): TV close =
+          последний settled RTH-клоуз → берём его напрямую (в премаркете это вчерашний клоуз)."""
+        if not isinstance(close, (int, float)):
+            return None
+        now = self._now_et()
+        hm = (now.hour, now.minute)
+        rth_live = (now.weekday() < 5 and (9, 30) <= hm < (16, 0))
+        if rth_live and isinstance(change_abs, (int, float)):
+            return close - change_abs
+        return close
+    def _combine(self, tvc, fh):
+        if CLOSE_SOURCE == "finnhub":
+            if fh: return fh, "finnhub"
+            if tvc: return tvc, "tv"
+        else:
+            if tvc: return tvc, "tv"
+            if fh: return fh, "finnhub"
+        return None, None
+    def _fetch_tv(self):
+        """→ {base: ref_close}. Биржу не гадаем: спрашиваем NASDAQ/NYSE/AMEX сразу, берём попавшую."""
+        out, s2b, syms = {}, {}, []
+        for it in self.inst:
+            t = us_ticker(it["base"])
+            for ex in ("NASDAQ", "NYSE", "AMEX"):
+                s = f"{ex}:{t}"; s2b[s] = it["base"]; syms.append(s)
+        for i in range(0, len(syms), 250):
+            try:
+                j = tv_scan(syms[i:i+250], ["close", "change_abs"])
+                for row in (j.get("data") or []):
+                    b = s2b.get(row.get("s")); d = row.get("d") or []
+                    if b and b not in out and len(d) >= 2:
+                        rc = self._ref_from(d[0], d[1])
+                        if rc:
+                            out[b] = rc
+            except Exception:
+                pass
+        return out
     def _loop(self):
         while True:
             marker = self._ref_marker()
-            for it in self.inst:
-                b = it["base"]
-                cur = self.ref.get(b)
-                if cur and cur.get("day") == marker:  # уже тянули в этой фазе (вкл. «нет данных»)
-                    continue
-                ust = us_ticker(b)
-                pc = None
-                for _ in range(3):                    # backoff на 429
-                    try:
-                        pc = finnhub_pc(ust); break
-                    except RateLimited:
-                        time.sleep(5)
-                    except Exception:
-                        break
+            if marker != self._marker:
+                try:
+                    tv = self._fetch_tv()             # 1) TV bulk — быстро, всем сразу
+                except Exception:
+                    tv = {}
                 with self.lock:
-                    self.ref[b] = {"close": pc, "src": ("finnhub" if pc else None),
-                                   "region": "US", "cur": ("USD" if pc else None),
-                                   "us": ust, "day": marker}
-                time.sleep(FINNHUB_MIN_GAP)           # бережём free-лимит 60/мин
-            time.sleep(CLOSE_REFRESH)                 # ждём смены фазы/даты ET
+                    for it in self.inst:
+                        b = it["base"]; tvc = tv.get(b); fh = self.ref.get(b, {}).get("fh")
+                        close, src = self._combine(tvc, fh)
+                        self.ref[b] = {"close": close, "src": src, "tv": tvc, "fh": fh,
+                                       "mismatch": bool(tvc and fh and abs(tvc-fh)/fh > 0.02),
+                                       "region": "US", "cur": ("USD" if close else None),
+                                       "us": us_ticker(b), "day": marker}
+                self._marker = marker
+                if FINNHUB_KEY:                        # 2) Finnhub — медленно, кросс-чек + фолбэк
+                    for it in self.inst:
+                        b = it["base"]
+                        fh = None
+                        for _ in range(3):
+                            try: fh = finnhub_pc(us_ticker(b)); break
+                            except RateLimited: time.sleep(5)
+                            except Exception: break
+                        with self.lock:
+                            r = self.ref.get(b, {}); tvc = r.get("tv")
+                            close, src = self._combine(tvc, fh)
+                            r.update({"fh": fh, "close": close, "src": src,
+                                      "mismatch": bool(tvc and fh and abs(tvc-fh)/fh > 0.02),
+                                      "cur": ("USD" if close else None)})
+                            self.ref[b] = r
+                        time.sleep(FINNHUB_MIN_GAP)
+            time.sleep(30)                             # проверяем смену маркера
 
 
 # ----------------------------- region / session / DST window -----------------------------
@@ -737,12 +802,13 @@ def build_snapshot(inst, pf, prem, pyth, ref, oif):
             if SERIES is not None:
                 SERIES.add_base(sym, base_px, time.time())
         basis = vp                                    # (live − база)/база, %
-        # close-референс (Finnhub pc — основной) и регион
+        # close-референс (TradingView — основной, Finnhub — фолбэк/кросс-чек) и регион
         rd = ref.get(base)
         close = rd["close"] if rd else None
         close_src = rd.get("src") if rd else None
+        close_mismatch = bool(rd and rd.get("mismatch"))   # TV vs Finnhub расходятся >2%
         region = (rd or {}).get("region", "US")
-        # гэп + надёжность (1c): лучше прочерк, чем мусор
+        # гэп + надёжность: лучше прочерк, чем мусор
         gap = None; gap_raw = None; suspect = False; reason = None
         if close and live is not None and close != 0:
             gap_raw = (live - close) / close * 100
@@ -752,13 +818,15 @@ def build_snapshot(inst, pf, prem, pyth, ref, oif):
                 suspect = True; reason = "аномалия >25%"
             else:
                 gap = gap_raw                         # торговый гэп
+                if close_mismatch:
+                    reason = f"клоуз расходится: TV {rd.get('tv')} vs Finnhub {rd.get('fh')}"
         elif live is not None:
-            reason = "нет надёжного клоуза (Finnhub)"
+            reason = "нет надёжного клоуза (TV/Finnhub)"
         oi = oif.get(sym) if oif else None
         st, in_win = session_state(region)
         row = {
             "ticker": it["tick"], "symbol": it["display"], "api": sym, "fam": fam,
-            "live": live, "close": close, "close_src": close_src,
+            "live": live, "close": close, "close_src": close_src, "close_mismatch": close_mismatch,
             "gap": gap, "gap_raw": gap_raw, "suspect": suspect, "reason": reason,
             "premium": premium, "pyth": vp, "basis": basis, "funding": funding, "oi": oi,
             "taker": it["taker"], "region": region, "session": st, "in_win": in_win,
@@ -771,7 +839,7 @@ def build_snapshot(inst, pf, prem, pyth, ref, oif):
         # стратегия: только акции с гэпом
         if fam == "stock" and gap is not None:
             bucket, label, tag = _strategy_label(base, gap)
-            item = {"ticker": base, "api": sym, "gap": gap,
+            item = {"ticker": base, "api": sym, "gap": gap, "mismatch": close_mismatch,
                     "label": label, "tag": tag, "region": region, "session": st, "in_win": in_win}
             if bucket == "short_weak":
                 buckets["short_weak"].append(item)
@@ -899,10 +967,16 @@ td.susp{color:var(--mut);text-decoration:underline dotted;cursor:help}
 #bxlink:hover{text-decoration:underline}
 .tvattr{color:var(--mut);font-size:10px;margin-left:10px}.tvattr a{color:var(--mut)}
 .tvbtn{color:var(--go)!important;border-color:var(--go)!important}
-.tvchart{color:var(--go);text-decoration:none;font-size:11px;margin-left:8px;border:1px solid var(--go);padding:3px 8px;border-radius:4px}
-.tvchart:hover{background:rgba(46,160,67,.12)}
-#buckets .srow{cursor:pointer}#buckets .srow:hover{background:rgba(56,139,253,.10)}
-#buckets .srow.sel{box-shadow:inset 2px 0 0 var(--blue)}
+.tvchart{color:var(--warn);text-decoration:none;font-size:11px;margin-left:8px;border:1px solid var(--warn);padding:3px 8px;border-radius:4px}
+.tvchart:hover{background:rgba(210,153,34,.14)}
+#buckets .bk{margin:0 0 14px}#buckets .bk h3{font-size:12px;margin:0 0 7px;letter-spacing:.3px}
+#buckets .srow{display:flex;justify-content:space-between;align-items:center;padding:7px 11px;
+border:1px solid var(--line);border-radius:6px;margin-bottom:5px;background:var(--panel);cursor:pointer}
+#buckets .srow:hover{background:rgba(56,139,253,.10)}
+#buckets .srow.sel{box-shadow:inset 3px 0 0 var(--blue)}
+#buckets .srow.win{border-color:var(--go)}#buckets .srow.warn{border-color:var(--warn)}
+#buckets .srow .l{display:flex;align-items:center;gap:8px}#buckets .srow .g{font-weight:700}
+td.warn{color:var(--warn);cursor:help}
 .sess{padding:3px 8px;border-radius:4px;border:1px solid var(--line);font-weight:700}
 .sess.rth{color:#0d1117;background:var(--go);border-color:var(--go)}
 .sess.pre{color:#0d1117;background:var(--warn);border-color:var(--warn)}
@@ -955,7 +1029,7 @@ font-size:10px;padding:2px 7px;border-radius:4px;margin-left:8px}
 <div id="faq" class="hide"><div class="faq">
 <h3>Что считает каждая колонка</h3>
 <p><b>Live BingX</b> — последняя цена перпа из WebSocket-потока (<code>@lastPrice</code>), обновляется в реалтайме. Иконка слева = источник цены (BingX); задел под другие биржи.</p>
-<p><b>Ref close</b> — вчерашний RTH-клоуз базового актива (Finnhub <code>pc</code> — основной источник). Якорь для гэпа, обновляется раз в день после закрытия US.</p>
+<p><b>Ref close</b> — последнее завершённое RTH-закрытие US. ОСНОВНОЙ источник — TradingView screener (<code>close − change_abs</code>, keyless, ~15-мин задержка), ФОЛБЭК/кросс-чек — Finnhub <code>pc</code>. В премаркете (15:30–16:30 МСК) = вчерашний клоуз. Если TV и Finnhub расходятся &gt;2% — строка помечена «клоуз расходится» (наведи на «⚠»). Обновляется раз в день (маркер pre/post 16:30 ET).</p>
 <p><b>Гэп% = (BingX − close) / close</b> — насколько перп ушёл от вчерашнего закрытия. «—» если нет надёжного Finnhub-клоуза, ИЛИ базис перп-vs-Pyth аномальный (&gt;5%) либо гэп &gt;25% — тогда строка «данные сомнительны» (наведи на «—»: причина + сырой %). Лучше прочерк, чем мусор.</p>
 <p><b>vs Pyth% = (BingX − Pyth) / Pyth</b> — кросс-чек против независимого оракула Pyth (реальная цена акции, real-time). Только где Pyth покрывает (≈109/153), иначе «—». Большое расхождение = перп оторвался от рынка. (Спред-премиум к индекс-цене BingX из таблицы убран.)</p>
 <p><b>OI $</b> — открытый интерес перпа в USD-нотионале (BingX <code>/openInterest</code>). У этих сток-перпов он с потолком ~$1M на инструмент, поэтому значения жмутся к ~$0.9–1.0M. <code>k/M</code> = тысячи/миллионы $. Пишется в sqlite-лог.</p>
@@ -1028,7 +1102,9 @@ function makeRow(x){const tr=document.createElement('tr');
   return {tr};}
 function updateRow(o,x){const ch=o.tr.children;
   o.tr.className=(x.in_win?'win ':'')+(x.api==SEL?'sel':'');
-  ch[1].textContent=f2(x.live);ch[2].textContent=f2(x.close);
+  ch[1].textContent=f2(x.live);
+  ch[2].textContent=f2(x.close)+(x.close_mismatch?' ⚠':'');ch[2].className=x.close_mismatch?'warn':'mut';
+  ch[2].title=x.close_mismatch?(x.reason||'клоуз расходится TV/Finnhub'):'';
   const g=ch[3];
   if(x.gap!=null){g.textContent=sgn(x.gap);g.className=cls(x.gap);g.title='';}
   else if(x.gap_raw!=null){g.textContent='—';g.className='susp';g.title=(x.reason||'данные сомнительны')+' · сырой '+sgn(x.gap_raw)+'%';}
@@ -1048,28 +1124,47 @@ function renderNum(s){const tb=document.getElementById('tb');const seen=new Set(
     tb.appendChild(frag);}
   if(SEL&&SELSRC==='num')positionChart();}
 
-/* ---- вкладка «Стратегия»: тоже кликабельно + заморозка ---- */
+/* ---- «Стратегия»: секции строятся 1 раз, строки обновляются ПО МЕСТУ (список НЕ пересоздаётся →
+   TV-iframe не перезагружается, аккордеон-график цел; при открытом графике структура заморожена) ---- */
+const STRAT_DEFS=[['fade_short','fade','✅ Фейд-шорт (ядро)'],['short_weak','short','Шорт 1–2% (не ядро)'],
+  ['long_weak','long','Лонг 1–2% (слабая нога)'],['skip','skip','Скип >2%'],['noise','noise','Шум <1%']];
+let stratBuilt=false;const stratSec={};const srowEls=new Map();
+function buildStrat(){const wrap=document.getElementById('buckets');wrap.innerHTML='';
+  for(const [key,c,title] of STRAT_DEFS){const sec=document.createElement('div');sec.className='bk '+c;
+    const h=document.createElement('h3');h.innerHTML=title+' <span class="mut cnt">(0)</span>';sec.appendChild(h);
+    const body=document.createElement('div');sec.appendChild(body);wrap.appendChild(sec);
+    stratSec[key]={body,cnt:h.querySelector('.cnt')};}
+  stratBuilt=true;}
+function makeSrow(it){const el=document.createElement('div');el.className='srow';
+  el.dataset.api=it.api;el.dataset.tick=it.ticker;
+  el.innerHTML=`<span class="l"><b>${it.ticker}</b>`+
+    (it.tag=='core'?' <span class="tag core">ядро</span>':(it.tag=='avoid'?' <span class="tag avoid">мусор</span>':''))+
+    `</span><span class="g"></span>`;
+  return {el,bucket:null,g:el.querySelector('.g')};}
 function renderStrat(s){const rg=s.regime,el=document.getElementById('regime');
   const q='<span class="qhelp" title="QQQ = ETF на Nasdaq-100, датчик режима всего рынка. Сильный гэп QQQ = трендовый день; фейдить отдельные растущие токены ПРОТИВ общего тренда рискованно.">(?)</span>';
   if(rg&&rg.gap!=null){const big=Math.abs(rg.gap)>=1;
     el.innerHTML=`QQQ ${sgn(rg.gap)}% ${q} — `+(big?'<b style="color:var(--skip)">трендовый день, фейд-шорт рискован</b>':'спокойно');
   }else el.innerHTML='QQQ — '+q;
-  const wrap=document.getElementById('buckets');
-  if(CHARTBOX&&wrap.contains(CHARTBOX))CHARTBOX.remove();   // спасаем график от rebuild
-  wrap.innerHTML='';
-  const defs=[['fade_short','fade','✅ Фейд-шорт (ядро)'],['short_weak','short','Шорт 1–2% (не ядро)'],
-    ['long_weak','long','Лонг 1–2% (слабая нога)'],['skip','skip','Скип >2%'],['noise','noise','Шум <1%']];
+  if(!stratBuilt)buildStrat();
   const b=(s.strategy&&s.strategy.buckets)||{};
+  const pinned=(SEL&&SELSRC=='strat');           // график открыт → структуру не трогаем
+  const now=new Map();
+  for(const [key] of STRAT_DEFS)for(const it of (b[key]||[]))now.set(it.api,{it,bucket:key});
+  for(const [api,ob] of now){const it=ob.it,bucket=ob.bucket;let o=srowEls.get(api);
+    if(!o){o=makeSrow(it);srowEls.set(api,o);}
+    o.g.textContent=sgn(it.gap)+'%';o.g.className='g '+cls(it.gap);
+    o.el.className='srow'+(it.in_win?' win':'')+(api==SEL?' sel':'')+(it.mismatch?' warn':'');
+    o.el.title=it.mismatch?'клоуз расходится TV/Finnhub':'';
+    if(o.bucket===null||(!pinned&&o.bucket!==bucket)){stratSec[bucket].body.appendChild(o.el);o.bucket=bucket;}}
+  if(!pinned)for(const [api,o] of srowEls){if(!now.has(api)){o.el.remove();srowEls.delete(api);}}
   const fidx={};if(FROZEN&&FROZEN_ORDER)FROZEN_ORDER.forEach((id,i)=>fidx[id]=i);
-  for(const [key,c,title] of defs){let items=(b[key]||[]).slice();
+  for(const [key] of STRAT_DEFS){let items=(b[key]||[]).slice();
     if(FROZEN&&FROZEN_ORDER)items.sort((x,y)=>((fidx[x.api]??9999)-(fidx[y.api]??9999)));
-    const div=document.createElement('div');div.className='bk '+c;
-    let h=`<h3>${title} <span class="mut">(${items.length})</span></h3>`;
-    for(const it of items){h+=`<div class="srow${it.in_win?' win':''}${it.api==SEL?' sel':''}" data-api="${it.api}" data-tick="${it.ticker}"><span>${it.ticker}`+
-      (it.tag=='core'?' <span class="tag core">ядро</span>':(it.tag=='avoid'?' <span class="tag avoid">мусор</span>':''))+
-      `</span><span><span class="${cls(it.gap)}">${sgn(it.gap)}%</span></span></div>`;}
-    div.innerHTML=h;wrap.appendChild(div);}
-  if(SEL&&SELSRC==='strat')positionChart();}
+    stratSec[key].cnt.textContent='('+items.length+')';
+    if(!pinned){const body=stratSec[key].body;
+      for(const it of items){const o=srowEls.get(it.api);if(o&&o.bucket===key)body.appendChild(o.el);}}}
+  if(SEL&&SELSRC=='strat')positionChart();}
 
 /* ---- график: lightweight-charts, аккордеон в ОБЕИХ вкладках ---- */
 function selectRow(api,tick,source){
@@ -1246,10 +1341,8 @@ def main():
     pf.start(); prem.start(); pyth.start(); ref.start(); oif.start(); SERIES.start(); siglog.start()
     print(f"WS: подписка на {len(symbols)} символов ({(len(symbols)+SUBS_PER_WS-1)//SUBS_PER_WS} соединений).")
     print(f"График: буфер 10 мин/символ — сид из 1m-klines (фоном) + добивка из WS; линия базы = Pyth.")
-    if FINNHUB_KEY:
-        print(f"Close-референс: Finnhub pc (основной), {len(bases)} тикеров последовательно (~3 мин).")
-    else:
-        print("!! FINNHUB_API_KEY не задан — клоуза не будет, гэпы пойдут прочерком. Задай env-ключ.")
+    print(f"Close-референс: источник='{CLOSE_SOURCE}' (TradingView screener bulk, keyless — основной; "
+          f"Finnhub {'есть' if FINNHUB_KEY else 'НЕТ ключа'} — фолбэк/кросс-чек >2%).")
     print(f"SQLite-лог сигналов: {DB_PATH if siglog.ok else '(отключён)'}")
     time.sleep(2.0)  # дать ws/premium наполниться
     cov_c, cov_t = pyth.coverage()

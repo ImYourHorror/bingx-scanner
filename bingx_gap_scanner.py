@@ -980,6 +980,9 @@ tbody tr{cursor:pointer}tbody tr:hover{background:rgba(56,139,253,.08)}
 tr.sel{background:rgba(56,139,253,.16)!important;box-shadow:inset 2px 0 0 var(--blue)}
 .fz{cursor:pointer;padding:3px 8px;border:1px solid var(--line);border-radius:4px;background:var(--panel);color:var(--mut)}
 .fz.on{color:#0d1117;background:var(--blue);border-color:var(--blue);font-weight:700}
+.search{padding:3px 9px;border:1px solid var(--line);border-radius:4px;background:var(--panel);color:var(--txt);font-size:12px;min-width:130px;outline:none}
+.search:focus{border-color:var(--blue)}
+.search::placeholder{color:var(--mut)}
 .bk{margin:0 0 14px}.bk h3{font-size:12px;margin:0 0 6px;letter-spacing:.3px}
 .bk.fade h3{color:var(--go)}.bk.skip h3{color:var(--skip)}.bk.noise h3{color:var(--mut)}
 .bk.long h3,.bk.short h3{color:var(--warn)}
@@ -1035,6 +1038,7 @@ font-size:10px;padding:2px 7px;border-radius:4px;margin-left:8px}
   <span class="pill">TW: <span id="tw">—</span></span>
   <span class="sess ah" id="sesspill">US: —</span>
   <span class="pill">US: закрытие 23:00 · вход ~16:00 · открытие 16:30 МСК <span class="qhelp" title="Гэп считается от вчерашнего закрытия US RTH (23:00 МСК). Вход в премаркет ~16:00–16:10 МСК, рынок открывается 16:30 МСК.">(?)</span></span>
+  <input id="search" class="search" type="search" placeholder="поиск тикера" autocomplete="off" spellcheck="false" oninput="onSearch(this.value)" onkeydown="if(event.key=='Escape'){this.value='';onSearch('');}">
   <span class="fz" id="freezebtn">❄ заморозить порядок</span>
 </div>
 <div class="tabs">
@@ -1101,7 +1105,20 @@ const tvExch=tk=>NYSE.has((tk||'').toUpperCase())?'NYSE':'NASDAQ';
 
 function show(t){['num','strat','faq'].forEach(x=>{
   document.getElementById(x).className=(x==t?'':'hide');
-  document.getElementById('t-'+x).className='tab'+(x==t?' on':'');});}
+  document.getElementById('t-'+x).className='tab'+(x==t?' on':'');});applyFilter();}
+
+/* ---- поиск по тикеру: клиентский слой ВИДИМОСТИ строк (не трогает данные/порядок/график/бэкенд) ---- */
+let SEARCH='';
+function matchTick(t){return !SEARCH||(''+(t||'')).toLowerCase().includes(SEARCH);}
+function onSearch(v){SEARCH=(''+(v||'')).trim().toLowerCase();applyFilter();}
+function applyFilter(){
+  for(const[,o]of rowEls)o.tr.style.display=matchTick(o.tr.dataset.tick)?'':'none';
+  if(SEL&&SELSRC==='num'&&CHARTROW){const o=rowEls.get(SEL);CHARTROW.style.display=(o&&matchTick(o.tr.dataset.tick))?'':'none';}
+  for(const[,o]of srowEls)o.el.style.display=matchTick(o.el.dataset.tick)?'':'none';
+  for(const key in stratSec){const body=stratSec[key].body;let vis=0;
+    for(const ch of body.children)if(ch.classList&&ch.classList.contains('srow')&&ch.style.display!=='none')vis++;
+    const sec=body.parentNode;if(sec)sec.style.display=(!SEARCH||vis>0)?'':'none';}
+}
 
 /* ---- sort / order ---- */
 function val(r,k){switch(k){
@@ -1157,7 +1174,7 @@ function renderNum(s){const tb=document.getElementById('tb');const seen=new Set(
     const frag=document.createDocumentFragment();
     for(const api of ordered){const o=rowEls.get(api);if(o)frag.appendChild(o.tr);}
     tb.appendChild(frag);}
-  if(SEL&&SELSRC==='num')positionChart();}
+  if(SEL&&SELSRC==='num')positionChart();applyFilter();}
 
 /* ---- «Стратегия»: секции строятся 1 раз, строки обновляются ПО МЕСТУ (список НЕ пересоздаётся →
    TV-iframe не перезагружается, аккордеон-график цел; при открытом графике структура заморожена) ---- */
@@ -1197,7 +1214,7 @@ function renderStrat(s){const rg=s.regime,el=document.getElementById('regime');
     stratSec[key].cnt.textContent='('+items.length+')';
     if(!pinned){const body=stratSec[key].body;
       for(const it of items){const o=srowEls.get(it.api);if(o&&o.bucket===key)body.appendChild(o.el);}}}
-  if(SEL&&SELSRC=='strat')positionChart();}
+  if(SEL&&SELSRC=='strat')positionChart();applyFilter();}
 
 /* ---- график: lightweight-charts, аккордеон в ОБЕИХ вкладках ---- */
 function selectRow(api,tick,source){

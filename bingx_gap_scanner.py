@@ -574,11 +574,11 @@ class RefData:
         return None, None
     def _fetch_tv(self):
         """→ {base: {"ref": клоуз, "prev": вчерашний close−change_abs, "tvsym": "EXCHANGE:SYMBOL" из ответа}}.
-        Биржу не гадаем: спрашиваем NASDAQ/NYSE/AMEX сразу, берём попавшую."""
+        Биржу не гадаем: спрашиваем NASDAQ/NYSE/AMEX/CBOE/BATS сразу, берём попавшую."""
         out, s2b, syms = {}, {}, []
         for it in self.inst:
             t = us_ticker(it["base"])
-            for ex in ("NASDAQ", "NYSE", "AMEX"):
+            for ex in ("NASDAQ", "NYSE", "AMEX", "CBOE", "BATS"):
                 s = f"{ex}:{t}"; s2b[s] = it["base"]; syms.append(s)
         for i in range(0, len(syms), 250):
             try:
@@ -642,10 +642,10 @@ class TWFeed:
         self.px = {}                    # base -> (price float, poll_ts)
         self.lock = threading.Lock()
         self.covered = 0
-        self._s2b, self._syms = {}, []  # биржу не гадаем: NASDAQ/NYSE/AMEX сразу, берём попавшую
+        self._s2b, self._syms = {}, []  # биржу не гадаем: NASDAQ/NYSE/AMEX/CBOE/BATS сразу, берём попавшую
         for it in self.inst:
             t = us_ticker(it["base"])
-            for ex in ("NASDAQ", "NYSE", "AMEX"):
+            for ex in ("NASDAQ", "NYSE", "AMEX", "CBOE", "BATS"):
                 s = f"{ex}:{t}"; self._s2b[s] = it["base"]; self._syms.append(s)
     def start(self):
         threading.Thread(target=self._loop, daemon=True).start()

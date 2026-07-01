@@ -59,7 +59,7 @@ HOST         = os.environ.get("GAP_HOST", "127.0.0.1")
 PORT         = int(os.environ.get("GAP_PORT", "8787"))
 OPEN_BROWSER = os.environ.get("GAP_OPEN_BROWSER", "1") == "1"
 
-SUBS_PER_WS       = 190     # лимит BingX 200/конн — берём с запасом
+SUBS_PER_WS       = 80      # эмпирически на 1 конн акается ~100 подписок → берём меньше, ДВА конна
 PREMIUM_REFRESH   = 5       # сек, bulk premiumIndex (один запрос на всё)
 PYTH_REFRESH      = 6       # сек, батч Pyth latest
 CLOSE_REFRESH     = 1800    # сек, дневной close (кэш на день всё равно)
@@ -99,15 +99,6 @@ TZ_TO_REGION = {
     "America/Sao_Paulo": "BR",
 }
 
-# Фиксапы тикера BingX → символ Yahoo (close). Без записи = берём как есть (US bare ticker).
-YF_FIX = {
-    "BRKB": "BRK-B", "IBMR": "IBM", "NETFLIX": "NFLX", "TSMU": "TSM",
-    "SAMSUNG": "005930.KS", "SKHYNIX": "000660.KS",
-    # индексы (NCSI base):
-    "NASDAQ100": "^NDX", "SP500": "^GSPC", "DOWJONES": "^DJI", "RUSSELL2000": "^RUT",
-    "NIKKEI225": "^N225", "GER40": "^GDAXI", "NIFTY50": "^NSEI", "KR200": "^KS200",
-    "BVSP": "^BVSP",
-}
 # Фиксапы тикера BingX → символ Pyth (Equity.US.<X>/USD)
 PYTH_FIX = {"BRKB": "BRK.B", "IBMR": "IBM", "NETFLIX": "NFLX"}
 # Фиксапы тикера BingX → реальный US-тикер для Finnhub (close pc). Иностранные без US-листинга
@@ -277,6 +268,7 @@ class PriceFeed:
         for sym in chunk:
             _ws_send(s, json.dumps({"id": sym, "reqType": "sub",
                                     "dataType": f"{sym}@lastPrice"}))
+            time.sleep(0.04)                   # троттлинг: иначе часть подписок не акается
         with self.lock:
             self.conns_up += 1
         s.settimeout(30)
@@ -488,29 +480,7 @@ class Series:
                 pass
             time.sleep(0.08)
 
-# lazy Yahoo 1m intraday (для base-линии, где Pyth не покрывает) — кэш 60 c
-_INTRADAY = {}
-def yahoo_intraday(yf, last_min=12):
-    if not yf:
-        return []
-    now = time.time(); c = _INTRADAY.get(yf)
-    if c and now - c[0] < 60:
-        return c[1]
-    try:
-        j = _http_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{yf}"
-                       f"?interval=1m&range=1d")
-        res = j["chart"]["result"][0]
-        ts = res.get("timestamp") or []
-        cl = (res.get("indicators", {}).get("quote", [{}])[0] or {}).get("close") or []
-        pts = [(int(t), float(x)) for t, x in zip(ts, cl) if x is not None][-last_min:]
-        _INTRADAY[yf] = (now, pts)
-        return pts
-    except Exception:
-        _INTRADAY[yf] = (now, [])
-        return []
-
-
-# ----------------------------- Yahoo close + region -----------------------------
+# ----------------------------- timezone helper -----------------------------
 def _et_naive_tz(name):
     if _HAVE_TZ:
         try:
@@ -518,24 +488,6 @@ def _et_naive_tz(name):
         except Exception:
             pass
     return timezone(timedelta(hours=0))
-
-def yahoo_daily(sym):
-    """→ (list[(date_str_local, close)], meta) или (None, None)."""
-    j = _http_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
-                   f"?interval=1d&range=1mo")
-    res = j["chart"]["result"][0]
-    meta = res.get("meta", {}) or {}
-    tzname = meta.get("exchangeTimezoneName") or "America/New_York"
-    tz = _et_naive_tz(tzname)
-    ts = res.get("timestamp") or []
-    closes = (res.get("indicators", {}).get("quote", [{}])[0] or {}).get("close") or []
-    rows = []
-    for t, c in zip(ts, closes):
-        if c is None:
-            continue
-        d = datetime.fromtimestamp(t, tz).strftime("%Y-%m-%d")
-        rows.append((d, float(c)))
-    return rows, meta
 
 class RateLimited(Exception):
     pass
@@ -579,15 +531,21 @@ class RefData:
     def get(self, base):
         with self.lock:
             return self.ref.get(base)
-    def _us_day(self):
-        return datetime.now(_et_naive_tz("America/New_York")).strftime("%Y-%m-%d")
+    def _ref_marker(self):
+        # Референс-клоуз должен быть ПОСЛЕДНИМ ЗАВЕРШЁННЫМ RTH-закрытием US.
+        # Маркер меняется при смене даты ET (00:00 ET = 07:00 МСК, задолго до премаркета
+        # 15:30–16:30 МСК → к премаркету pc свежий = вчерашний клоуз) И после 17:00 ET
+        # (закрытие+сеттлмент → pc перевернулся на сегодняшний клоуз для вечера/овернайта).
+        now = datetime.now(_et_naive_tz("America/New_York"))
+        phase = "post" if (now.weekday() < 5 and (now.hour, now.minute) >= (17, 0)) else "pre"
+        return now.strftime("%Y-%m-%d") + phase
     def _loop(self):
         while True:
-            day = self._us_day()
+            marker = self._ref_marker()
             for it in self.inst:
                 b = it["base"]
                 cur = self.ref.get(b)
-                if cur and cur.get("day") == day:     # уже тянули сегодня (вкл. «нет данных»)
+                if cur and cur.get("day") == marker:  # уже тянули в этой фазе (вкл. «нет данных»)
                     continue
                 ust = us_ticker(b)
                 pc = None
@@ -601,9 +559,9 @@ class RefData:
                 with self.lock:
                     self.ref[b] = {"close": pc, "src": ("finnhub" if pc else None),
                                    "region": "US", "cur": ("USD" if pc else None),
-                                   "us": ust, "day": day}
+                                   "us": ust, "day": marker}
                 time.sleep(FINNHUB_MIN_GAP)           # бережём free-лимит 60/мин
-            time.sleep(CLOSE_REFRESH)                 # ждём, пока не сменится день ET
+            time.sleep(CLOSE_REFRESH)                 # ждём смены фазы/даты ET
 
 
 # ----------------------------- region / session / DST window -----------------------------
@@ -660,10 +618,14 @@ class OIFeed:
         with self.lock:
             return self.oi.get(sym)
     def _loop(self):
+        logged = 0
         while True:
             for sym in self.symbols:
                 try:
                     d = _bingx("/openApi/swap/v2/quote/openInterest", {"symbol": sym})
+                    if logged < 3:                    # сырой ответ в лог для сверки единиц
+                        print(f"OI raw [{sym}]: {json.dumps(d, ensure_ascii=False)}")
+                        logged += 1
                     v = d.get("openInterest") if isinstance(d, dict) else (
                         d[0].get("openInterest") if isinstance(d, list) and d else None)
                     if v is not None:
@@ -721,7 +683,6 @@ LOCK = threading.Lock()
 
 # глобалы для /series (ставятся в main)
 SERIES = None          # Series
-SYM2YF = {}            # api-symbol -> Yahoo-символ базы (для lazy intraday base-линии)
 
 def _strategy_label(base, gap):
     """Черновик-бакеты. Знак гэпа всегда виден у вызывающего."""
@@ -745,6 +706,8 @@ def build_snapshot(inst, pf, prem, pyth, ref, oif):
         sym, fam, base = it["symbol"], it["fam"], it["base"]
         pv = pf.get(sym)
         live = pv[0] if pv else None
+        if live is None:                    # нет live-цены BingX → торговать нельзя → скрываем
+            continue
         # spread / premium из BingX
         pm = prem.get(sym)
         premium = None
@@ -808,7 +771,7 @@ def build_snapshot(inst, pf, prem, pyth, ref, oif):
         # стратегия: только акции с гэпом
         if fam == "stock" and gap is not None:
             bucket, label, tag = _strategy_label(base, gap)
-            item = {"ticker": base, "symbol": it["display"], "gap": gap,
+            item = {"ticker": base, "api": sym, "gap": gap,
                     "label": label, "tag": tag, "region": region, "session": st, "in_win": in_win}
             if bucket == "short_weak":
                 buckets["short_weak"].append(item)
@@ -829,6 +792,9 @@ def build_snapshot(inst, pf, prem, pyth, ref, oif):
     cov_c, cov_t = pyth.coverage()
     now_msk = datetime.now(MSK)
     windows = {r: window_msk_str(r) for r in REGIONS}
+    us_st, _ = session_state("US")
+    us_session = {"пре": "премаркет", "RTH": "RTH (торги)", "afterh": "afterhours",
+                  "выходной": "выходной"}.get(us_st, us_st)
     with LOCK:
         STATE.update({
             "updated": now_msk.strftime("%H:%M:%S МСК"),
@@ -837,7 +803,7 @@ def build_snapshot(inst, pf, prem, pyth, ref, oif):
             "strategy": {"note": "ЧЕРНОВИК — пороги не оттестированы", "buckets": buckets},
             "ws": f"{cw} конн · {cp} цен",
             "pyth": f"{cov_c}/{cov_t} акций",
-            "windows": windows,
+            "windows": windows, "us_session": us_session,
             "note": "",
         })
 
@@ -932,20 +898,30 @@ td.susp{color:var(--mut);text-decoration:underline dotted;cursor:help}
 #bxlink{color:var(--blue);text-decoration:none;font-size:11px;margin-left:8px}
 #bxlink:hover{text-decoration:underline}
 .tvattr{color:var(--mut);font-size:10px;margin-left:10px}.tvattr a{color:var(--mut)}
+.tvbtn{color:var(--go)!important;border-color:var(--go)!important}
+.tvchart{color:var(--go);text-decoration:none;font-size:11px;margin-left:8px;border:1px solid var(--go);padding:3px 8px;border-radius:4px}
+.tvchart:hover{background:rgba(46,160,67,.12)}
+#buckets .srow{cursor:pointer}#buckets .srow:hover{background:rgba(56,139,253,.10)}
+#buckets .srow.sel{box-shadow:inset 2px 0 0 var(--blue)}
+.sess{padding:3px 8px;border-radius:4px;border:1px solid var(--line);font-weight:700}
+.sess.rth{color:#0d1117;background:var(--go);border-color:var(--go)}
+.sess.pre{color:#0d1117;background:var(--warn);border-color:var(--warn)}
+.sess.ah{color:var(--mut)}
 .draft{display:inline-block;background:var(--warn);color:#0d1117;font-weight:700;
 font-size:10px;padding:2px 7px;border-radius:4px;margin-left:8px}
 .hide{display:none}
 </style></head><body><div class="wrap">
 <h1>BingX · TradFi real-time</h1>
-<div class="sub">live = WebSocket lastPrice · спред = премиум (last−index)/index · гэп = (live − Finnhub close)/close · клик по строке → график · обновлено <span id="upd">—</span></div>
+<div class="sub">live = WebSocket lastPrice · гэп = (live − Finnhub close)/close · vs Pyth = базис к реальной цене · клик по строке → график · обновлено <span id="upd">—</span></div>
 <div class="bar">
   <span class="pill">ws: <span id="ws">—</span></span>
   <span class="pill">pyth: <span id="pyth">—</span></span>
-  <span class="pill" id="winpill">окна входа</span>
+  <span class="sess ah" id="sesspill">US: —</span>
+  <span class="pill">US: закрытие 23:00 · вход ~16:00 · открытие 16:30 МСК <span class="qhelp" title="Гэп считается от вчерашнего закрытия US RTH (23:00 МСК). Вход в премаркет ~16:00–16:10 МСК, рынок открывается 16:30 МСК.">(?)</span></span>
   <span class="fz" id="freezebtn">❄ заморозить порядок</span>
 </div>
 <div class="tabs">
-  <span class="tab on" id="t-num" onclick="show('num')">Числа</span>
+  <span class="tab on" id="t-num" onclick="show('num')">Акции</span>
   <span class="tab" id="t-strat" onclick="show('strat')">Стратегия</span>
   <span class="tab" id="t-faq" onclick="show('faq')">FAQ</span>
 </div>
@@ -953,22 +929,18 @@ font-size:10px;padding:2px 7px;border-radius:4px;margin-left:8px}
 <div id="num">
 <table><thead><tr>
 <th class="l" data-key="ticker">Тикер<span class="ar"></span></th>
-<th class="l" data-key="symbol">Symbol<span class="ar"></span></th>
-<th data-key="live"><svg class="bxico" width="13" height="13" viewBox="0 0 48 48"><defs><linearGradient id="bxg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2ee6c8"/><stop offset="1" stop-color="#2962ff"/></linearGradient></defs><path d="M6 8 L20 24 L6 40 L13 40 L27 24 L13 8 Z" fill="url(#bxg)"/><path d="M22 8 L36 24 L22 40 L29 40 L43 24 L29 8 Z" fill="url(#bxg)"/></svg>Live BingX<span class="ar"></span></th>
+<th data-key="live"><svg class="bxico" width="13" height="13" viewBox="0 0 150 150"><defs><linearGradient id="bxLogo" x1="17.68" y1="116.45" x2="132.14" y2="32.11" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#2a54ff"/><stop offset=".52" stop-color="#2143cb"/><stop offset="1" stop-color="#2a54ff"/></linearGradient></defs><path fill="url(#bxLogo)" d="M140.2,22.33c-25.18-.09-49.79,10.83-66.63,29.47-6.06,6.27-10.1,13.95-14.96,21.06-11.64,15.93-29.81,25.14-49.5,25.13h0v28.65h0c25.17,.1,49.78-10.86,66.63-29.5,6.03-6.27,10.13-13.94,14.96-21.06,11.64-15.91,29.81-25.12,49.5-25.11V22.33h0Z"/><path fill="#2a54ff" d="M140.2,97.99c-19.68,0-37.86-9.2-49.5-25.11-4.81-7.12-8.92-14.78-14.94-21.06C58.95,33.18,34.3,22.24,9.13,22.35h0v28.65h0c21.8-.11,42.05,11.62,53.01,30.46,3.22,5.62,7.06,10.9,11.45,15.74,16.83,18.63,41.46,29.59,66.63,29.5l-.02-28.7h0Z"/></svg>Live BingX<span class="ar"></span></th>
 <th data-key="close">Ref close<span class="ar"></span></th>
 <th data-key="gap">Гэп%<span class="ar"></span></th>
-<th data-key="premium">Спред%<span class="ar"></span></th>
 <th data-key="pyth">vs Pyth%<span class="ar"></span></th>
-<th data-key="oi">OI<span class="ar"></span></th>
+<th data-key="oi">OI $<span class="ar"></span></th>
 <th data-key="funding">Funding<span class="ar"></span></th>
-<th data-key="fee">Fee<span class="ar"></span></th>
-<th class="l" data-key="session">Сессия/регион<span class="ar"></span></th>
 </tr></thead><tbody id="tb"></tbody></table>
 
 <div class="legend">
-<span class="dot stock"></span>акции/ETF (только NCSK, вкл. QQQ) · клик по заголовку — сортировка (A→Z, Z→A, сброс), числовые — числом ·
-<b>«заморозить порядок»</b> = таблица не переставляется (значения тикают) · <b>клик по строке → график-аккордеон (lightweight-charts)</b> ·
-гэп «—» = нет надёжного клоуза ИЛИ данные сомнительны (наведи на «—»)
+только US-акции/ETF (NCSK, вкл. QQQ); строки без live-цены BingX скрыты (торговать нельзя) · клик по заголовку — сортировка (числовые — числом) ·
+<b>«заморозить порядок»</b> работает и в «Акции», и в «Стратегия» · <b>клик по строке → график (lightweight-charts)</b> в обеих вкладках ·
+<b>OI $</b> = открытый интерес в USD-нотионале (потолок ~$1M/инструмент) · гэп «—» = нет клоуза/данные сомнительны (наведи)
 </div>
 </div>
 
@@ -985,12 +957,10 @@ font-size:10px;padding:2px 7px;border-radius:4px;margin-left:8px}
 <p><b>Live BingX</b> — последняя цена перпа из WebSocket-потока (<code>@lastPrice</code>), обновляется в реалтайме. Иконка слева = источник цены (BingX); задел под другие биржи.</p>
 <p><b>Ref close</b> — вчерашний RTH-клоуз базового актива (Finnhub <code>pc</code> — основной источник). Якорь для гэпа, обновляется раз в день после закрытия US.</p>
 <p><b>Гэп% = (BingX − close) / close</b> — насколько перп ушёл от вчерашнего закрытия. «—» если нет надёжного Finnhub-клоуза, ИЛИ базис перп-vs-Pyth аномальный (&gt;5%) либо гэп &gt;25% — тогда строка «данные сомнительны» (наведи на «—»: причина + сырой %). Лучше прочерк, чем мусор.</p>
-<p><b>Спред% = (BingX − indexPrice) / indexPrice</b> — премиум перпа: отклонение последней цены от индекс-цены BingX. Есть у всех, real-time.</p>
-<p><b>vs Pyth% = (BingX − Pyth) / Pyth</b> — кросс-чек против независимого оракула Pyth (реальная цена акции, real-time). Только где Pyth покрывает (≈109/153), иначе «—». Большое расхождение = перп оторвался от рынка.</p>
-<p><b>OI</b> — открытый интерес перпа (BingX REST, <code>/openInterest</code>). <code>k/M</code> = тысячи/миллионы. Пишется и в sqlite-лог.</p>
-<p><b>Funding</b> — ставка финансирования за период (напр. <code>+0.0100%/8h</code>). Платится ВСЕГДА — часть реального коста удержания, отдельно от Fee. «+» лонги платят шортам.</p>
-<p><b>Fee</b> — стандартный taker (0.05%). Видеть рядом с funding важно для экономики сделки.</p>
-<p><b>Сессия/регион</b> — состояние рынка базы (RTH / пре / afterh / выходной), регион US (универс — US-акции/ETF). В шапке — реф. <b>закрытие US</b> в МСК (DST учитывается).</p>
+<p><b>vs Pyth% = (BingX − Pyth) / Pyth</b> — кросс-чек против независимого оракула Pyth (реальная цена акции, real-time). Только где Pyth покрывает (≈109/153), иначе «—». Большое расхождение = перп оторвался от рынка. (Спред-премиум к индекс-цене BingX из таблицы убран.)</p>
+<p><b>OI $</b> — открытый интерес перпа в USD-нотионале (BingX <code>/openInterest</code>). У этих сток-перпов он с потолком ~$1M на инструмент, поэтому значения жмутся к ~$0.9–1.0M. <code>k/M</code> = тысячи/миллионы $. Пишется в sqlite-лог.</p>
+<p><b>Funding</b> — ставка финансирования за период (напр. <code>+0.0100%/8h</code>). Платится ВСЕГДА — часть реального коста удержания. «+» лонги платят шортам. (Стандартный taker 0.05% — постоянная величина, из таблицы убрана.)</p>
+<p><b>Сессия US</b> — состояние рынка (премаркет / RTH / afterhours / выходной) вынесено одним индикатором в шапку; меняется в течение дня и важно для окна входа.</p>
 <h3>Вкладка «Стратегия» (черновик)</h3>
 <p>Раскладывает акции по знаковому гэпу: <b>✅ фейд-шорт</b> = перп выше закрытия на 1–2% И тикер из «ядра» (играем на возврат вниз); <b>шорт 1–2% не ядро</b> и <b>лонг 1–2%</b> (слабая нога) — пограничные; <b>скип &gt;2%</b> — гэп убегает; <b>шум &lt;1%</b> — мелочь. Пороги НЕ оттестированы — это черновик.</p>
 <h3>Почему по части тикеров клоуз/гэп скрыт</h3>
@@ -1008,12 +978,13 @@ const REFRESH=__REFRESH__;
 const f2=(x,d=2)=>x==null?'—':Number(x).toFixed(d);
 const sgn=(x,d=2)=>x==null?'—':(x>0?'+':'')+Number(x).toFixed(d);
 const cls=x=>x==null?'mut':(x>0?'up':(x<0?'dn':''));
-const fmtOi=v=>v==null?'—':(Math.abs(v)>=1e6?(v/1e6).toFixed(2)+'M':Math.abs(v)>=1e3?Math.round(v/1e3)+'k':''+Math.round(v));
-let LAST=null, SEL=null, SELTICK=null, SELFAM=null, TVON=false, LASTORDER='';
+const fmtOi=v=>v==null?'—':'$'+(Math.abs(v)>=1e6?(v/1e6).toFixed(2)+'M':Math.abs(v)>=1e3?Math.round(v/1e3)+'k':''+Math.round(v));
+let LAST=null, SEL=null, SELTICK=null, SELSRC=null, TVON=false, LASTORDER='';
 let SORT={key:null,dir:0}, FROZEN=false, FROZEN_ORDER=null;
-let CHART=null,BXS=null,BASES=null,CHARTROW=null,lastBxT=0,lastBaseT=0;
+let CHART=null,BXS=null,BASES=null,CHARTBOX=null,CHARTROW=null,lastBxT=0,lastBaseT=0;
 const rowEls=new Map();
-const FAMRANK={stock:0,index:1,commodity:2,forex:3};
+const NYSE=new Set(['GS','JPM','MS','JNJ','XOM','COP','OXY','SLB','LNG','PFE','LLY','MCD','NKE','WMT','GE','F','IBM','LMT','MGM','MP','NU','RACE','BB','GLW','HPQ','CCL','CRCL','ORCL','GME','SPCE','UNH','SNAP','BRKB','DELL']);
+const tvExch=tk=>NYSE.has((tk||'').toUpperCase())?'NYSE':'NASDAQ';
 
 function show(t){['num','strat','faq'].forEach(x=>{
   document.getElementById(x).className=(x==t?'':'hide');
@@ -1021,14 +992,12 @@ function show(t){['num','strat','faq'].forEach(x=>{
 
 /* ---- sort / order ---- */
 function val(r,k){switch(k){
-  case 'ticker':return r.ticker||'';case 'symbol':return r.symbol||'';
-  case 'session':return (r.session||'')+'/'+(r.region||'');
+  case 'ticker':return r.ticker||'';
   case 'live':return r.live;case 'close':return r.close;case 'gap':return r.gap;
-  case 'premium':return r.premium;case 'pyth':return r.pyth;case 'fee':return r.taker;
-  case 'oi':return r.oi;case 'funding':return r.funding?r.funding.rate:null;}return null;}
-function defcmp(a,b){const d=(FAMRANK[a.fam]??9)-(FAMRANK[b.fam]??9);if(d)return d;
-  const sa=a.gap!=null?Math.abs(a.gap):(a.premium!=null?Math.abs(a.premium):-1);
-  const sb=b.gap!=null?Math.abs(b.gap):(b.premium!=null?Math.abs(b.premium):-1);return sb-sa;}
+  case 'pyth':return r.pyth;case 'oi':return r.oi;
+  case 'funding':return r.funding?r.funding.rate:null;}return null;}
+function defcmp(a,b){const sa=a.gap!=null?Math.abs(a.gap):(a.pyth!=null?Math.abs(a.pyth):-1);
+  const sb=b.gap!=null?Math.abs(b.gap):(b.pyth!=null?Math.abs(b.pyth):-1);return sb-sa;}
 function cmp(a,b,k,dir){const va=val(a,k),vb=val(b,k);
   const na=(va==null||va===''),nb=(vb==null||vb==='');
   if(na&&nb)return defcmp(a,b);if(na)return 1;if(nb)return -1;
@@ -1044,81 +1013,91 @@ function updateArrows(){document.querySelectorAll('th[data-key]').forEach(th=>{
 function sortBy(k){
   if(SORT.key!==k)SORT={key:k,dir:1};else if(SORT.dir===1)SORT.dir=-1;else SORT={key:null,dir:0};
   if(FROZEN&&LAST)FROZEN_ORDER=sortedApis(LAST.rows);
-  updateArrows();LASTORDER='';if(LAST)renderNum(LAST);}
+  updateArrows();LASTORDER='';if(LAST){renderNum(LAST);renderStrat(LAST);}}
 function toggleFreeze(){const b=document.getElementById('freezebtn');
   if(!FROZEN){FROZEN_ORDER=(LAST?orderRows(LAST.rows):[]);FROZEN=true;b.textContent='❄ порядок заморожен';b.classList.add('on');}
   else{FROZEN=false;FROZEN_ORDER=null;b.textContent='❄ заморозить порядок';b.classList.remove('on');}
-  LASTORDER='';if(LAST)renderNum(LAST);}
+  LASTORDER='';if(LAST){renderNum(LAST);renderStrat(LAST);}}
 
-/* ---- table: строка создаётся 1 раз, дальше обновляем ЯЧЕЙКИ ПО МЕСТУ ---- */
+/* ---- таблица «Акции»: строка 1 раз, ячейки обновляем ПО МЕСТУ ---- */
 function makeRow(x){const tr=document.createElement('tr');
-  tr.dataset.api=x.api;tr.dataset.tick=x.ticker;tr.dataset.fam=x.fam;
+  tr.dataset.api=x.api;tr.dataset.tick=x.ticker;
   const tag=x.tag?`<span class="tag ${x.tag}">${x.tag=='core'?'ядро':'мусор'}</span>`:'';
   tr.innerHTML=`<td class="l"><span class="dot ${x.fam}"></span>${x.ticker}${x.is_regime?' ★':''}${tag}</td>`+
-    `<td class="l mut">${x.symbol||'—'}</td><td></td><td class="mut"></td><td></td><td></td><td></td>`+
-    `<td class="mut"></td><td class="mut"></td><td class="mut">${x.taker==null?'—':(Number(x.taker)*100).toFixed(2)+'%'}</td>`+
-    `<td class="l mut"></td>`;
+    `<td></td><td class="mut"></td><td></td><td></td><td class="mut"></td><td class="mut"></td>`;
   return {tr};}
 function updateRow(o,x){const ch=o.tr.children;
   o.tr.className=(x.in_win?'win ':'')+(x.api==SEL?'sel':'');
-  ch[2].textContent=f2(x.live);ch[3].textContent=f2(x.close);
-  const g=ch[4];
+  ch[1].textContent=f2(x.live);ch[2].textContent=f2(x.close);
+  const g=ch[3];
   if(x.gap!=null){g.textContent=sgn(x.gap);g.className=cls(x.gap);g.title='';}
   else if(x.gap_raw!=null){g.textContent='—';g.className='susp';g.title=(x.reason||'данные сомнительны')+' · сырой '+sgn(x.gap_raw)+'%';}
   else{g.textContent='—';g.className='mut';g.title=x.reason||'';}
-  ch[5].textContent=sgn(x.premium,3);ch[5].className=cls(x.premium);
-  ch[6].textContent=sgn(x.pyth,3);ch[6].className=cls(x.pyth);
-  ch[7].textContent=fmtOi(x.oi);
-  ch[8].textContent=(x.funding&&x.funding.rate!=null)?sgn(x.funding.rate,4)+'%/'+(x.funding.ih||'?')+'h':'—';
-  ch[10].textContent=x.session+' · '+x.region;}
+  ch[4].textContent=sgn(x.pyth,3);ch[4].className=cls(x.pyth);
+  ch[5].textContent=fmtOi(x.oi);
+  ch[6].textContent=(x.funding&&x.funding.rate!=null)?sgn(x.funding.rate,4)+'%/'+(x.funding.ih||'?')+'h':'—';}
 function renderNum(s){const tb=document.getElementById('tb');const seen=new Set();
   for(const x of s.rows){seen.add(x.api);let o=rowEls.get(x.api);
     if(!o){o=makeRow(x);rowEls.set(x.api,o);tb.appendChild(o.tr);}updateRow(o,x);}
   for(const[api,o]of rowEls){if(!seen.has(api)){o.tr.remove();rowEls.delete(api);}}
   const ordered=orderRows(s.rows);const key=ordered.join(',');
-  if(key!==LASTORDER&&!SEL){LASTORDER=key;       // график открыт → порядок не трогаем (не прыгает)
-    if(CHARTROW&&CHARTROW.parentNode)CHARTROW.remove();
+  const pinned=(SEL&&SELSRC==='num');            // график открыт в таблице → не пересортировываем
+  if(key!==LASTORDER&&!pinned){LASTORDER=key;
     const frag=document.createDocumentFragment();
     for(const api of ordered){const o=rowEls.get(api);if(o)frag.appendChild(o.tr);}
     tb.appendChild(frag);}
-  if(CHARTROW&&SEL&&rowEls.get(SEL)){const a=rowEls.get(SEL).tr;
-    if(CHARTROW.previousSibling!==a)tb.insertBefore(CHARTROW,a.nextSibling);}}
+  if(SEL&&SELSRC==='num')positionChart();}
 
-/* ---- strategy tab ---- */
+/* ---- вкладка «Стратегия»: тоже кликабельно + заморозка ---- */
 function renderStrat(s){const rg=s.regime,el=document.getElementById('regime');
   const q='<span class="qhelp" title="QQQ = ETF на Nasdaq-100, датчик режима всего рынка. Сильный гэп QQQ = трендовый день; фейдить отдельные растущие токены ПРОТИВ общего тренда рискованно.">(?)</span>';
   if(rg&&rg.gap!=null){const big=Math.abs(rg.gap)>=1;
     el.innerHTML=`QQQ ${sgn(rg.gap)}% ${q} — `+(big?'<b style="color:var(--skip)">трендовый день, фейд-шорт рискован</b>':'спокойно');
   }else el.innerHTML='QQQ — '+q;
+  const wrap=document.getElementById('buckets');
+  if(CHARTBOX&&wrap.contains(CHARTBOX))CHARTBOX.remove();   // спасаем график от rebuild
+  wrap.innerHTML='';
   const defs=[['fade_short','fade','✅ Фейд-шорт (ядро)'],['short_weak','short','Шорт 1–2% (не ядро)'],
     ['long_weak','long','Лонг 1–2% (слабая нога)'],['skip','skip','Скип >2%'],['noise','noise','Шум <1%']];
-  const wrap=document.getElementById('buckets');wrap.innerHTML='';
   const b=(s.strategy&&s.strategy.buckets)||{};
-  for(const [key,c,title] of defs){const items=b[key]||[];
+  const fidx={};if(FROZEN&&FROZEN_ORDER)FROZEN_ORDER.forEach((id,i)=>fidx[id]=i);
+  for(const [key,c,title] of defs){let items=(b[key]||[]).slice();
+    if(FROZEN&&FROZEN_ORDER)items.sort((x,y)=>((fidx[x.api]??9999)-(fidx[y.api]??9999)));
     const div=document.createElement('div');div.className='bk '+c;
     let h=`<h3>${title} <span class="mut">(${items.length})</span></h3>`;
-    for(const it of items){h+=`<div class="row${it.in_win?' win':''}"><span>${it.ticker}`+
+    for(const it of items){h+=`<div class="srow${it.in_win?' win':''}${it.api==SEL?' sel':''}" data-api="${it.api}" data-tick="${it.ticker}"><span>${it.ticker}`+
       (it.tag=='core'?' <span class="tag core">ядро</span>':(it.tag=='avoid'?' <span class="tag avoid">мусор</span>':''))+
-      `</span><span><span class="${cls(it.gap)}">${sgn(it.gap)}%</span> · <span class="mut">${it.session}/${it.region}</span></span></div>`;}
-    div.innerHTML=h;wrap.appendChild(div);}}
+      `</span><span><span class="${cls(it.gap)}">${sgn(it.gap)}%</span></span></div>`;}
+    div.innerHTML=h;wrap.appendChild(div);}
+  if(SEL&&SELSRC==='strat')positionChart();}
 
-/* ---- chart: lightweight-charts, строка-аккордеон ---- */
-function selectRow(api,tick,fam){
+/* ---- график: lightweight-charts, аккордеон в ОБЕИХ вкладках ---- */
+function selectRow(api,tick,source){
   if(SEL===api){closeChart();return;}
-  SEL=api;SELTICK=tick;SELFAM=fam;TVON=false;
-  buildChartRow(tick,api,fam);if(LAST)renderNum(LAST);initChart();refreshChart(true);}
-function buildChartRow(tick,api,fam){
-  if(!CHARTROW){CHARTROW=document.createElement('tr');CHARTROW.className='chartrow';}
-  const tvbtn=(fam=='stock'||fam=='index')?'<span class="tvbtn" id="tvbtn" onclick="toggleTV()">показать TradingView</span>':'';
-  CHARTROW.innerHTML=`<td colspan="11"><div class="cbox">`+
-    `<div class="chead"><b id="ctitle">${tick} · ${api}</b>`+
-    `<a id="bxlink" target="_blank" rel="noopener" href="https://bingx.com/en/perpetual/${api}">открыть на BingX ↗</a>`+
+  closeChart();
+  SEL=api;SELTICK=tick;SELSRC=source;TVON=false;
+  fillChartBox(tick,api);positionChart();initChart();refreshChart(true);}
+function fillChartBox(tick,api){
+  if(!CHARTBOX){CHARTBOX=document.createElement('div');CHARTBOX.className='cbox';}
+  const ex=tvExch(tick);
+  CHARTBOX.innerHTML=
+    `<div class="chead"><b>${tick} · ${api}</b>`+
+    `<a class="mut" style="margin-left:8px" target="_blank" rel="noopener" href="https://bingx.com/en/perpetual/${api}">BingX ↗</a>`+
     `<span id="cbasis" class="mut"></span><span class="cx" onclick="closeChart()">✕</span></div>`+
     `<div id="cchart"></div>`+
     `<div class="cleg"><span style="color:#2f81f7">━ BingX перп</span> &nbsp; <span style="color:#d29922">━ <span id="lbase">база</span></span>`+
     `<span class="tvattr">графики: <a href="https://www.tradingview.com" target="_blank" rel="noopener">TradingView</a> Lightweight Charts™</span></div>`+
-    `<div class="tvrow">${tvbtn}<span class="mut"> — внешний виджет TradingView отдельной панелью (для сверки)</span></div>`+
-    `<div id="tvwrap"></div></div>`;}
+    `<div class="tvrow"><span class="tvbtn" id="tvbtn" onclick="toggleTV()">показать TradingView</span>`+
+    `<a class="tvchart" target="_blank" rel="noopener" href="https://www.tradingview.com/chart/?symbol=${ex}:${encodeURIComponent(tick)}">график на TradingView ↗</a></div>`+
+    `<div id="tvwrap"></div>`;}
+function ensureChartRow(){if(!CHARTROW){CHARTROW=document.createElement('tr');CHARTROW.className='chartrow';
+    CHARTROW.innerHTML='<td colspan="7"></td>';}return CHARTROW;}
+function positionChart(){if(!SEL||!CHARTBOX)return;
+  if(SELSRC==='num'){const o=rowEls.get(SEL);if(!o)return;ensureChartRow();
+    if(CHARTROW.firstElementChild.firstChild!==CHARTBOX)CHARTROW.firstElementChild.appendChild(CHARTBOX);
+    if(o.tr.nextSibling!==CHARTROW)o.tr.parentNode.insertBefore(CHARTROW,o.tr.nextSibling);}
+  else{const a=document.querySelector('#buckets .srow[data-api="'+SEL+'"]');
+    if(a&&a.nextSibling!==CHARTBOX)a.after(CHARTBOX);}}
 function initChart(){const el=document.getElementById('cchart');if(!el||!window.LightweightCharts)return;
   el.innerHTML='';
   CHART=LightweightCharts.createChart(el,{autoSize:true,
@@ -1137,16 +1116,19 @@ function toSeries(arr){const out=[];let lt=-1;
 async function refreshChart(initial){if(!SEL||!CHART)return;let d;
   try{d=await(await fetch('/series?symbol='+encodeURIComponent(SEL),{cache:'no-store'})).json();}catch(e){return;}
   const bx=toSeries(d.bingx||[]),base=toSeries(d.base||[]);
-  if(initial){if(bx.length)BXS.setData(bx);if(base.length)BASES.setData(base);CHART.timeScale().fitContent();
+  if(initial){if(bx.length)BXS.setData(bx);BASES.setData(base);CHART.timeScale().fitContent();
     lastBxT=bx.length?bx[bx.length-1].time:0;lastBaseT=base.length?base[base.length-1].time:0;}
   else{for(const pt of bx)if(pt.time>=lastBxT){BXS.update(pt);lastBxT=pt.time;}
        for(const pt of base)if(pt.time>=lastBaseT){BASES.update(pt);lastBaseT=pt.time;}}
   const bl=bx.length?bx[bx.length-1].value:null,ba=base.length?base[base.length-1].value:null;
   const basis=(bl!=null&&ba)?((bl-ba)/ba*100):null;
   const cb=document.getElementById('cbasis');if(cb)cb.innerHTML=bl!=null?
-    ('BingX '+bl.toFixed(2)+(ba?(' · база '+ba.toFixed(2)+' ('+d.base_src+(d.base_delayed?', delayed':'')+') · базис <b class="'+cls(basis)+'">'+sgn(basis,3)+'%</b>'):' · база —')):'ждём тики…';
-  const lb=document.getElementById('lbase');if(lb)lb.textContent=d.base_src=='pyth'?'база: Pyth (real-time)':(d.base_src=='yahoo'?'база: Yahoo (delayed)':'базы нет');}
-function closeChart(){if(CHART){try{CHART.remove();}catch(e){}CHART=null;}if(CHARTROW)CHARTROW.remove();SEL=null;LASTORDER='';if(LAST)renderNum(LAST);}
+    ('BingX '+bl.toFixed(2)+(ba?(' · база '+ba.toFixed(2)+' (Pyth) · базис <b class="'+cls(basis)+'">'+sgn(basis,3)+'%</b>'):' · базы нет')):'ждём тики…';
+  const lb=document.getElementById('lbase');if(lb)lb.textContent=(d.base_src=='pyth')?'база: Pyth (real-time)':'база: нет данных';}
+function closeChart(){if(CHART){try{CHART.remove();}catch(e){}CHART=null;}
+  if(CHARTBOX&&CHARTBOX.parentNode)CHARTBOX.remove();
+  if(CHARTROW&&CHARTROW.parentNode)CHARTROW.remove();
+  SEL=null;SELSRC=null;LASTORDER='';if(LAST)renderNum(LAST);}
 function toggleTV(){TVON=!TVON;const wrap=document.getElementById('tvwrap');const btn=document.getElementById('tvbtn');
   if(!TVON){wrap.innerHTML='';btn.textContent='показать TradingView';return;}
   btn.textContent='скрыть TradingView';
@@ -1161,15 +1143,19 @@ async function tick(){try{const s=await(await fetch('/data',{cache:'no-store'}))
   document.getElementById('upd').textContent=s.updated||'—';
   document.getElementById('ws').textContent=s.ws||'—';
   document.getElementById('pyth').textContent=s.pyth||'—';
-  const w=s.windows||{};
-  document.getElementById('winpill').textContent=`закрытие US ${w.US||'—'} МСК · откр: EU ${w.EU||'—'} HK ${w.HK||'—'} JP ${w.JP||'—'} KR ${w.KR||'—'}`;
+  const sp=document.getElementById('sesspill'),us=s.us_session||'—';
+  sp.textContent='US: '+us;
+  sp.className='sess '+(us.indexOf('RTH')>=0?'rth':(us.indexOf('премаркет')>=0?'pre':'ah'));
   renderNum(s);renderStrat(s);if(SEL)refreshChart(false);
   }catch(e){document.getElementById('upd').textContent='нет связи с локальным сервером';}}
 
 document.querySelectorAll('th[data-key]').forEach(th=>th.addEventListener('click',()=>sortBy(th.dataset.key)));
 document.getElementById('tb').addEventListener('click',e=>{
   if(e.target.closest('.chartrow'))return;
-  const tr=e.target.closest('tr[data-api]');if(tr)selectRow(tr.dataset.api,tr.dataset.tick,tr.dataset.fam);});
+  const tr=e.target.closest('tr[data-api]');if(tr)selectRow(tr.dataset.api,tr.dataset.tick,'num');});
+document.getElementById('buckets').addEventListener('click',e=>{
+  if(e.target.closest('.cbox'))return;
+  const r=e.target.closest('.srow[data-api]');if(r)selectRow(r.dataset.api,r.dataset.tick,'strat');});
 document.getElementById('freezebtn').addEventListener('click',toggleFreeze);
 tick();setInterval(tick,REFRESH*1000);
 </script></body></html>"""
@@ -1199,13 +1185,10 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/series"):
             sym = (parse_qs(urlparse(self.path).query).get("symbol") or [""])[0]
             bx, base = (SERIES.get(sym) if SERIES else ([], []))
-            src = "pyth" if base else "none"; delayed = False
-            if not base:                                   # Pyth не покрывает → lazy Yahoo intraday
-                pts = yahoo_intraday(SYM2YF.get(sym))
-                if pts:
-                    base, src, delayed = pts, "yahoo", True
+            # база = ТОЛЬКО Pyth (real-time). Нет Pyth → базовой линии нет (Yahoo убран совсем).
+            src = "pyth" if base else "none"
             self._json({"symbol": sym, "bingx": bx, "base": base,
-                        "base_src": src, "base_delayed": delayed})
+                        "base_src": src, "base_delayed": False})
         elif self.path.startswith("/static/"):
             name = os.path.basename(urlparse(self.path).path)   # basename => без обхода путей
             fp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", name)
@@ -1250,10 +1233,8 @@ def main():
     symbols = [it["symbol"] for it in inst]
     bases   = [it["base"] for it in inst if it["fam"] == "stock"]
 
-    global SERIES, SYM2YF
+    global SERIES
     SERIES = Series(symbols)
-    SYM2YF = {it["symbol"]: (YF_FIX.get(it["base"], it["base"]) if it["fam"] in ("stock", "index") else None)
-              for it in inst}
 
     pf   = PriceFeed(symbols)
     pf.series = SERIES

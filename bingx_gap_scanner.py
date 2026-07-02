@@ -143,6 +143,10 @@ RTH_CLOSE_UTC = (20, 0)      # RTH-закрытие US при EDT (зимой 21
 RECON_DEPTH_DATES = 10       # recon чинит пропуски/NULL за последние N дат лога (15m у BingX ~10 дней)
 RECON_HOUR_UTC   = 1         # ночной прогон recon ~01:30 UTC (US-клоуз 20:00 UTC давно прошёл)
 QQQ_REG_BAND = 0.20          # мёртвая зона режима QQQ, как REG_BAND в gap_cells_1m.py: "рос" = gap > +0.2
+# Группа "Лонг 1-2% (слабая нога)" во вкладке Стратегия: лонг-фейд down-гэпа 1-2%.
+# ОТКЛЮЧЕНА 02.07.2026: in-sample слабый, walk-forward не проходил. Код сохранён в запас
+# (бакет long_weak считается всегда, флаг гасит только рендер). Вернуть = True.
+SHOW_WEAK_LEG_GROUP = False
 
 # ----------------------------- Батч 2.5: коллектор 1m klines -----------------------------
 # BingX хранит 1m ~сутки - копим свою историю в отдельной базе.
@@ -1378,16 +1382,18 @@ def _strategy_label(base, gap):
     a = abs(gap)
     if a < 1:
         return "noise", "шум <1%"
-    if a >= 2:
-        return "skip", "скип >2% (убегает)"
-    if gap > 0:   # перп ВЫШЕ close → фейд-шорт (up-гэп 1–2%, единый бакет)
-        return "fade_short", "фейд-шорт 1–2%"
-    return "long_weak", "лонг 1–2% (слабая нога)"   # перп НИЖЕ close
+    if gap >= 5:   # up-гэп >= +5%: континуация-лонг (gap-and-go), вход 16:00, стоп 2% обязателен
+        return "cont_long", "континуация-лонг >5% (gap-and-go)"
+    if a >= 2:     # 2-5% обеих сторон + down >5% (без режима) - скип
+        return "skip", "скип 2-5% / down >5%"
+    if gap > 0:   # перп ВЫШЕ close -> фейд-шорт (up-гэп 1-2%, единый бакет)
+        return "fade_short", "фейд-шорт 1-2%"
+    return "long_weak", "лонг 1-2% (слабая нога)"   # перп НИЖЕ close; рендер за флагом SHOW_WEAK_LEG_GROUP
 
 def build_snapshot(inst, pf, prem, pyth, tw, ref, oif):
     rows = []
     regime = None
-    buckets = {"fade_short": [], "long_weak": [], "skip": [], "noise": []}
+    buckets = {"fade_short": [], "cont_long": [], "long_weak": [], "skip": [], "noise": []}
     for it in inst:
         sym, fam, base = it["symbol"], it["fam"], it["base"]
         pv = pf.get(sym)
@@ -1613,7 +1619,7 @@ font-size:10px;padding:2px 7px;border-radius:4px;margin-left:8px}
   <span class="pill">TW: <span id="tw">—</span></span>
   <span class="sess ah" id="sesspill">US: —</span>
   <span class="pill"><span id="cellc" class="mut">Cell C: —</span> <span class="qhelp" title="Cell C: шорт-континуация down-гэпа 2-5% при QQQ-гэпе вверх (band +0.2% как в движке клеток). In-sample PF 2.97, N=44. Форвардом НЕ подтверждено.">(?)</span></span>
-  <span class="pill">US: закрытие 23:00 · вход ~16:00 · открытие 16:30 МСК <span class="qhelp" title="Гэп считается от вчерашнего закрытия US RTH (23:00 МСК). Вход в премаркет ~16:00–16:10 МСК, рынок открывается 16:30 МСК.">(?)</span></span>
+  <span class="pill">US: закрытие 23:00 · вход ~16:00 · открытие 16:30 МСК <span class="qhelp" title="Гэп считается от вчерашнего закрытия US RTH (23:00 МСК). Вход в премаркет ~16:00-16:10 МСК, рынок открывается 16:30 МСК.">(?)</span></span>
   <input id="search" class="search" type="search" placeholder="поиск тикера" autocomplete="off" spellcheck="false" oninput="onSearch(this.value)" onkeydown="if(event.key=='Escape'){this.value='';onSearch('');}">
   <span class="fz" id="freezebtn">❄ заморозить порядок</span>
 </div>
@@ -1633,42 +1639,43 @@ font-size:10px;padding:2px 7px;border-radius:4px;margin-left:8px}
 </tr></thead><tbody id="tb"></tbody></table>
 
 <div class="legend">
-только US-акции/ETF (NCSK, вкл. QQQ); строки без live-цены BingX скрыты (торговать нельзя) · клик по заголовку — сортировка (числовые — числом) ·
+только US-акции/ETF (NCSK, вкл. QQQ); строки без live-цены BingX скрыты (торговать нельзя) · клик по заголовку - сортировка (числовые - числом) ·
 <b>«заморозить порядок»</b> работает и в «Акции», и в «Стратегия» · <b>клик по строке → график (lightweight-charts)</b> в обеих вкладках ·
 <b>ГЭП% (TW)</b> = BingX vs вчерашний TW-клоуз (стабилен при любой сессии) · гэп «—» = нет клоуза/данные сомнительны (наведи) · OI убран из таблицы, пишется в лог · на графике базовая линия = внутридневная TW (задержка ~15м)
 </div>
 </div>
 
 <div id="strat" class="hide">
-<div class="regime" id="regime">QQQ —</div>
+<div class="regime" id="regime">QQQ -</div>
 <div id="buckets"></div>
-<div class="legend">Бакеты строятся по знаковому гэпу акций: ✅ фейд-шорт = перп выше close на 1–2% ·
-&gt;2% скип (со знаком) · &lt;1% шум · перп ниже close 1–2% = лонг (слабая нога). Это ЧЕРНОВИК.</div>
+<div class="legend">Бакеты по знаковому гэпу: ✅ фейд-шорт = up 1-2% · 🚀 континуация-лонг = up &gt;=5% (вход 16:00, стоп 2% обязателен, чище от &gt;7%; спекулятивно) ·
+скип = 2-5% обеих сторон и down &gt;5% без режима · шум &lt;1%. Режим QQQ: band +-0.2% (рос / падал / нейтр), как в движке клеток. Это ЧЕРНОВИК.</div>
 </div>
 
 <div id="faq" class="hide"><div class="faq">
 <h3>Что считает каждая колонка</h3>
-<p><b>Live BingX</b> — последняя цена перпа из WebSocket-потока (<code>@lastPrice</code>), обновляется в реалтайме. Иконка слева = источник цены (BingX); задел под другие биржи.</p>
-<p><b>Ref close</b> — последнее завершённое RTH-закрытие US. ОСНОВНОЙ источник — TradingView screener (<code>close − change_abs</code>, keyless, ~15-мин задержка), ФОЛБЭК/кросс-чек — Finnhub <code>pc</code>. В премаркете (15:30–16:30 МСК) = вчерашний клоуз. Если TV и Finnhub расходятся &gt;2% — строка помечена «клоуз расходится» (наведи на «⚠»). Обновляется раз в день (маркер pre/post 16:30 ET).</p>
-<p><b>ГЭП% (TW) = (BingX − вчерашний TW-клоуз) / клоуз</b> — насколько перп ушёл от вчерашнего RTH-закрытия US (клоуз = REF CLOSE из TradingView screener). Стабилен при любой сессии (всегда к вчерашнему клоузу). «—» если нет надёжного клоуза, либо гэп &gt;25% — тогда строка «данные сомнительны» (наведи на «—»: причина + сырой %). Лучше прочерк, чем мусор.</p>
-<p><b>Внутридневная TW (только график)</b> — на графике базовая линия и базис к перпу считаются от ТЕКУЩЕЙ цены TradingView (задержка ~15м; тот же screener, что и клоуз). Отдельной колонки в таблице нет: в премаркет текущая TW = вчерашнему клоузу и дублировала бы ГЭП%. Нет US/ADR-листинга → базы нет. (Pyth-андерлайн отключён флагом <code>USE_PYTH</code>, код на месте.)</p>
-<p><b>OI</b> — открытый интерес перпа (USD-нотионал, потолок ~$1M/инструмент). Колонка из таблицы убрана (из-за капа между инструментами почти не различает), но <b>продолжает писаться в sqlite-лог</b> для ресёрча.</p>
-<p><b>Funding</b> — ставка финансирования за период (напр. <code>+0.0100%/8h</code>). Платится ВСЕГДА — часть реального коста удержания. «+» лонги платят шортам. (Стандартный taker 0.05% — постоянная величина, из таблицы убрана.)</p>
-<p><b>Сессия US</b> — состояние рынка (премаркет / RTH / afterhours / выходной) вынесено одним индикатором в шапку; меняется в течение дня и важно для окна входа.</p>
+<p><b>Live BingX</b> - последняя цена перпа из WebSocket-потока (<code>@lastPrice</code>), обновляется в реалтайме. Иконка слева = источник цены (BingX); задел под другие биржи.</p>
+<p><b>Ref close</b> - последнее завершённое RTH-закрытие US. ОСНОВНОЙ источник - TradingView screener (<code>close − change_abs</code>, keyless, ~15-мин задержка), ФОЛБЭК/кросс-чек - Finnhub <code>pc</code>. В премаркете (15:30-16:30 МСК) = вчерашний клоуз. Если TV и Finnhub расходятся &gt;2% - строка помечена «клоуз расходится» (наведи на «⚠»). Обновляется раз в день (маркер pre/post 16:30 ET).</p>
+<p><b>ГЭП% (TW) = (BingX − вчерашний TW-клоуз) / клоуз</b> - насколько перп ушёл от вчерашнего RTH-закрытия US (клоуз = REF CLOSE из TradingView screener). Стабилен при любой сессии (всегда к вчерашнему клоузу). «—» если нет надёжного клоуза, либо гэп &gt;25% - тогда строка «данные сомнительны» (наведи на «—»: причина + сырой %). Лучше прочерк, чем мусор.</p>
+<p><b>Внутридневная TW (только график)</b> - на графике базовая линия и базис к перпу считаются от ТЕКУЩЕЙ цены TradingView (задержка ~15м; тот же screener, что и клоуз). Отдельной колонки в таблице нет: в премаркет текущая TW = вчерашнему клоузу и дублировала бы ГЭП%. Нет US/ADR-листинга → базы нет. (Pyth-андерлайн отключён флагом <code>USE_PYTH</code>, код на месте.)</p>
+<p><b>OI</b> - открытый интерес перпа (USD-нотионал, потолок ~$1M/инструмент). Колонка из таблицы убрана (из-за капа между инструментами почти не различает), но <b>продолжает писаться в sqlite-лог</b> для ресёрча.</p>
+<p><b>Funding</b> - ставка финансирования за период (напр. <code>+0.0100%/8h</code>). Платится ВСЕГДА - часть реального коста удержания. «+» лонги платят шортам. (Стандартный taker 0.05% - постоянная величина, из таблицы убрана.)</p>
+<p><b>Сессия US</b> - состояние рынка (премаркет / RTH / afterhours / выходной) вынесено одним индикатором в шапку; меняется в течение дня и важно для окна входа.</p>
 <h3>Вкладка «Стратегия» (черновик)</h3>
-<p>Раскладывает акции по знаковому гэпу: <b>✅ фейд-шорт</b> = перп выше закрытия на 1–2% (играем на возврат вниз); <b>шорт 1–2%</b> и <b>лонг 1–2%</b> (слабая нога) пограничные; <b>скип &gt;2%</b> гэп убегает; <b>шум &lt;1%</b> мелочь. Пороги НЕ оттестированы, это черновик.</p>
+<p>Раскладывает акции по знаковому гэпу: <b>✅ фейд-шорт</b> = перп выше закрытия на 1-2% (играем на возврат вниз); <b>🚀 континуация-лонг</b> = up-гэп &gt;=5% (gap-and-go: вход 16:00, стоп 2% ОБЯЗАТЕЛЕН, чище от &gt;7%; walk-forward НЕ пройден - спекулятивный сетап); <b>скип</b> = 2-5% обеих сторон и down &gt;5% без режима; <b>шум &lt;1%</b> мелочь. Группа "лонг 1-2% (слабая нога)" отключена 02.07.2026 (walk-forward не прошла), код сохранён за флагом. Пороги in-sample, это черновик.</p>
 <h3>Почему по части тикеров клоуз/гэп скрыт</h3>
-<p>Перп номинирован в USD. Для иностранных акций без US-листинга (Samsung, SK Hynix) Finnhub не отдаёт <code>pc</code> → клоуза нет → гэп «—». Остаётся спред (внутри-инструментный) и базис vs Pyth, где Pyth покрывает. С 31.07.2026 публичный Hermes-Pyth станет платным — поэтому Finnhub оставлен ОСНОВНЫМ клоуз-источником, а источник переключаем параметром.</p>
+<p>Перп номинирован в USD. Для иностранных акций без US-листинга (Samsung, SK Hynix) Finnhub не отдаёт <code>pc</code> → клоуза нет → гэп «—». Остаётся спред (внутри-инструментный) и базис vs Pyth, где Pyth покрывает. С 31.07.2026 публичный Hermes-Pyth станет платным - поэтому Finnhub оставлен ОСНОВНЫМ клоуз-источником, а источник переключаем параметром.</p>
 <h3>Про «0-fee» (важно)</h3>
-<p>«0 Fees» в интерфейсе BingX — это <b>временное промо</b> (≈до 31.07.2026), а не постоянная фича, и с catch'ем: только реферальные юзеры и только <b>ручная</b> торговля. <b>Любой включённый API-ключ лишает льготы — даже для ручных ордеров.</b> Значит через API/бота списывается стандарт 0.02%/0.05% + funding. Для автоматизации костовый потолок остаётся.</p>
+<p>«0 Fees» в интерфейсе BingX - это <b>временное промо</b> (≈до 31.07.2026), а не постоянная фича, и с catch'ем: только реферальные юзеры и только <b>ручная</b> торговля. <b>Любой включённый API-ключ лишает льготы - даже для ручных ордеров.</b> Значит через API/бота списывается стандарт 0.02%/0.05% + funding. Для автоматизации костовый потолок остаётся.</p>
 <h3>Про график и TradingView</h3>
-<p>Клик по строке разворачивает график-аккордеон (TradingView <b>lightweight-charts</b>, Apache 2.0, вендорится локально): сплошная линия <b>BingX</b> (перп, WS) против <b>реальной базы</b> (Pyth real-time, иначе Yahoo <i>delayed</i>) — базис вживую. Буфер 10 мин/символ на сервере (сид из 1m-свечей + WS), real-time через <code>series.update</code>. У TradingView нет data-API, поэтому их линию не тянем; готовый виджет TV — отдельной кнопкой для сверки. Атрибуция TradingView обязательна по лицензии.</p>
+<p>Клик по строке разворачивает график-аккордеон (TradingView <b>lightweight-charts</b>, Apache 2.0, вендорится локально): сплошная линия <b>BingX</b> (перп, WS) против <b>реальной базы</b> (Pyth real-time, иначе Yahoo <i>delayed</i>) - базис вживую. Буфер 10 мин/символ на сервере (сид из 1m-свечей + WS), real-time через <code>series.update</code>. У TradingView нет data-API, поэтому их линию не тянем; готовый виджет TV - отдельной кнопкой для сверки. Атрибуция TradingView обязательна по лицензии.</p>
 </div></div>
 
 </div>
 <script src="/static/lightweight-charts.standalone.production.js"></script>
 <script>
 const REFRESH=__REFRESH__;
+const SHOW_WEAK_LEG=__WEAKLEG__;   /* группа "лонг 1-2% (слабая нога)": отключена 02.07.2026, код в запасе */
 const f2=(x,d=2)=>x==null?'—':Number(x).toFixed(d);
 const sgn=(x,d=2)=>x==null?'—':(x>0?'+':'')+Number(x).toFixed(d);
 const cls=x=>x==null?'mut':(x>0?'up':(x<0?'dn':''));
@@ -1753,8 +1760,10 @@ function renderNum(s){const tb=document.getElementById('tb');const seen=new Set(
 
 /* ---- «Стратегия»: секции строятся 1 раз, строки обновляются ПО МЕСТУ (список НЕ пересоздаётся →
    TV-iframe не перезагружается, аккордеон-график цел; при открытом графике структура заморожена) ---- */
-const STRAT_DEFS=[['fade_short','fade','✅ Фейд-шорт 1–2%'],
-  ['long_weak','long','Лонг 1–2% (слабая нога)'],['skip','skip','Скип >2%'],['noise','noise','Шум <1%']];
+const STRAT_DEFS=[['fade_short','fade','✅ Фейд-шорт 1-2%'],
+  ['cont_long','long','🚀 Континуация-лонг >5% (gap-and-go) <span class="mut" style="font-weight:400">вход 16:00, стоп 2% ОБЯЗАТЕЛЕН, чище от >7%</span> <span class="qhelp" title="in-sample: >5% только со стопом 2% (PF 1.13, N125), >7% PF 1.29 (N46); walk-forward НЕ пройден (оверфит) - спекулятивный сетап">(?)</span>'],
+  ...(SHOW_WEAK_LEG?[['long_weak','long','Лонг 1-2% (слабая нога)']]:[]),
+  ['skip','skip','Скип 2-5% / down >5%'],['noise','noise','Шум <1%']];
 let stratBuilt=false;const stratSec={};const srowEls=new Map();
 function buildStrat(){const wrap=document.getElementById('buckets');wrap.innerHTML='';
   for(const [key,c,title] of STRAT_DEFS){const sec=document.createElement('div');sec.className='bk '+c;
@@ -1767,10 +1776,11 @@ function makeSrow(it){const el=document.createElement('div');el.className='srow'
   el.innerHTML=`<span class="l"><b>${it.ticker}</b></span><span class="g"></span>`;
   return {el,bucket:null,g:el.querySelector('.g')};}
 function renderStrat(s){const rg=s.regime,el=document.getElementById('regime');
-  const q='<span class="qhelp" title="QQQ = ETF на Nasdaq-100, датчик режима всего рынка. Сильный гэп QQQ = трендовый день; фейдить отдельные растущие токены ПРОТИВ общего тренда рискованно.">(?)</span>';
-  if(rg&&rg.gap!=null){const big=Math.abs(rg.gap)>=1;
-    el.innerHTML=`QQQ ${sgn(rg.gap)}% ${q} — `+(big?'<b style="color:var(--skip)">трендовый день, фейд-шорт рискован</b>':'спокойно');
-  }else el.innerHTML='QQQ — '+q;
+  const q='<span class="qhelp" title="QQQ = ETF на Nasdaq-100, датчик режима. Band +-0.2% как REG_BAND в движке клеток: рос / падал / нейтр. QQQ рос + down-гэп тикера 2-5% = условие Cell C; фейд-шорт против роста рискован.">(?)</span>';
+  if(rg&&rg.gap!=null){const g=rg.gap;   /* режим по клеточному порогу +-0.2%, как в шапке-индикаторе */
+    const reg=g>0.2?'<b style="color:var(--up)">рос</b>':(g<-0.2?'<b style="color:var(--dn)">падал</b>':'нейтр');
+    el.innerHTML=`QQQ ${sgn(g)}% ${q} - режим: `+reg;
+  }else el.innerHTML='QQQ - '+q;
   if(!stratBuilt)buildStrat();
   const b=(s.strategy&&s.strategy.buckets)||{};
   const pinned=(SEL&&SELSRC=='strat');           // график открыт → структуру не трогаем
@@ -1939,7 +1949,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(HTML.replace("__REFRESH__", str(BROWSER_REFRESH)).encode("utf-8"))
+            body = (HTML.replace("__REFRESH__", str(BROWSER_REFRESH))
+                        .replace("__WEAKLEG__", "true" if SHOW_WEAK_LEG_GROUP else "false"))
+            self.wfile.write(body.encode("utf-8"))
 
 
 def main():
